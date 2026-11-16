@@ -1,0 +1,29 @@
+2026/11/16-17:11:52.784 478c Creating DB D:\project\univer-demo\.tmp\chrome-profile6\Default\Local Storage\leveldb since it was missing.
+2026/11/16-17:11:53.000 478c Reusing MANIFEST D:\project\univer-demo\.tmp\chrome-profile6\Default\Local Storage\leveldb/MANIFEST-000001
+2026/11/16-17:18:41.095 5970 Level-0 table #5: started
+2026/11/16-17:18:41.099 5970 Level-0 table #5: 11306 bytes OK
+2026/11/16-17:18:41.101 5970 Delete type=0 #3
+2026/11/16-17:19:58.274 5970 Level-0 table #7: started
+2026/11/16-17:19:58.278 5970 Level-0 table #7: 11206 bytes OK
+2026/11/16-17:19:58.280 5970 Delete type=0 #4
+2026/11/16-17:20:14.871 5970 Level-0 table #9: started
+2026/11/16-17:20:14.876 5970 Level-0 table #9: 11214 bytes OK
+2026/11/16-17:20:14.878 5970 Delete type=0 #6
+2026/11/16-17:20:29.951 5970 Level-0 table #11: started
+2026/11/16-17:20:29.956 5970 Level-0 table #11: 11027 bytes OK
+2026/11/16-17:20:29.958 5970 Delete type=0 #8
+2026/11/16-17:20:45.030 5970 Level-0 table #13: started
+2026/11/16-17:20:45.035 5970 Level-0 table #13: 12100 bytes OK
+2026/11/16-17:20:45.036 5970 Delete type=0 #10
+2026/11/16-17:20:59.578 5970 Level-0 table #15: started
+2026/11/16-17:20:59.581 5970 Level-0 table #15: 12101 bytes OK
+2026/11/16-17:20:59.582 5970 Delete type=0 #12
+2026/11/16-17:20:59.582 5970 Compacting 4@0 + 1@1 files
+2026/11/16-17:20:59.586 5970 Generated table #16@0: 3 keys, 12290 bytes
+2026/11/16-17:20:59.586 5970 Compacted 4@0 + 1@1 files => 12290 bytes
+2026/11/16-17:20:59.586 5970 compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/11/16-17:20:59.587 5970 Delete type=2 #7
+2026/11/16-17:20:59.587 5970 Delete type=2 #9
+2026/11/16-17:20:59.587 5970 Delete type=2 #11
+2026/11/16-17:20:59.587 5970 Delete type=2 #13
+2026/11/16-17:20:59.587 5970 Delete type=2 #15

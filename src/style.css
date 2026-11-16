@@ -1,0 +1,79 @@
+/*
+ * 全局基线。控件尺寸一律交给 Element Plus 的变量（--el-component-size / --el-font-size-base），
+ * 这里只固定正文 14px，不再用媒体查询改根字号——那会让 32px 的标准控件跟着一起变形。
+ */
+
+:root {
+  --sans: system-ui, 'Segoe UI', 'Microsoft YaHei', Roboto, sans-serif;
+  --mono: ui-monospace, Consolas, 'Courier New', monospace;
+
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5715;
+  letter-spacing: 0.2px;
+  color-scheme: light;
+  color: #303133;
+  background: #f5f7fa;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/*
+ * 已移除 Vite 脚手架的 prefers-color-scheme: dark 变量覆写。
+ * Univer 的深色模式要用 new Univer({ darkMode: true }) 控制，
+ * 全局变量会把表格区域一起染黑。
+ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  margin: 0;
+  font-weight: 600;
+  color: #303133;
+}
+
+h2 {
+  font-size: 18px;
+}
+
+h3 {
+  font-size: 15px;
+}
+
+h4 {
+  font-size: 14px;
+}
+
+p {
+  margin: 0;
+}
+
+code {
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: #f2f3f5;
+  color: #c7254e;
+}
+
+#app {
+  width: 100%;
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
