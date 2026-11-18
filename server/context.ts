@@ -8,17 +8,60 @@
  */
 import './browser-shim'
 
-export { db, rolesOf, hasRole, userById, orgById, resetDemo, scopeOrgs } from '../src/system/db'
-export { workbench, taskViewsFor, loadFill, saveDraft, submitReport, recordDetail, auditOperate, revokeAudit, summaryView } from '../src/system/flow'
+export { db, rolesOf, hasRole, userById, orgById, resetDemo, scopeOrgs, nextId, logOp, recordsOf, taskById } from '../src/system/db'
+export { workbench, taskViewsFor, loadFill, saveDraft, submitReport, recordDetail, auditOperate, revokeAudit, summaryView, createExportJob, exportJobs } from '../src/system/flow'
 export type { FillContext, WriteResult, TaskView, SummaryFilter } from '../src/system/flow'
-export { orgTree } from '../src/system/service'
+export {
+  orgTree,
+  saveOrg,
+  removeOrg,
+  saveDept,
+  saveUser,
+  createTask,
+  archiveTask,
+  tickTasks,
+  saveTemplate,
+  changeTemplateStatus,
+  saveField,
+  removeField,
+  moveField,
+  publishVersion,
+  saveDiff,
+  removeDiff,
+  copyDiff,
+  savePerm,
+  removePerm,
+} from '../src/system/service'
+export type { OrgNode } from '../src/system/service'
 export { canAuditNode } from '../src/system/service'
+export { previewSchema, resolveSchema, mergeFields, decidePerm } from '../src/system/schema-service'
 export { heartbeat, lockHolder, attachmentsOf } from '../src/system/runtime'
 export { addAttachment, removeAttachment } from '../src/system/runtime'
 export type { UploadLimit } from '../src/system/runtime'
 export { validateForm } from '../src/system/validate'
 export type { ValidateError } from '../src/system/validate'
-export { buildProgress } from '../src/system/row2col'
+export { buildProgress, buildWideCsv, buildProgressCsv } from '../src/system/row2col'
 export { ApiError, ERR, ERR_MSG } from '../src/system/errors'
-export type { SysUser, FieldValue, ID } from '../src/system/types'
+export { OPER_TYPE } from '../src/system/types'
+export type {
+  SysUser,
+  FieldValue,
+  ID,
+  SysOrg,
+  SysDept,
+  SysRole,
+  FormTask,
+  PageResult,
+  FormTemplate,
+  FormField,
+  FormOrgDiff,
+  FormFieldPermission,
+  TemplateVersion,
+  FormSchema,
+  DiffType,
+  PermType,
+  TargetType,
+  ExportJob,
+  FormOperLog,
+} from '../src/system/types'
 export type { FormAttachment } from '../src/system/types'

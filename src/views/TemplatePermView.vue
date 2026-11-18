@@ -4,47 +4,55 @@
  * 并支持任选「用户 + 单位」预览裁决结果（7.2 算法的可视化自证）。
  * 规则本身不带版本列：作用于模板整体，随版本演进的快照在版本发布时留存。
  */
-import { computed, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { Delete, EditPen, Plus } from '@element-plus/icons-vue'
 import SchemaTrace from '../components/SchemaTrace.vue'
-import { api } from '../system/api'
-import { db, orgById } from '../system/db'
-import { decidePerm, detailFields, headerFields, PERM_LABEL, TARGET_LABEL } from '../system/schema-service'
+import { remote, type RemotePermDecisionRow, type RemoteTemplateBoard } from '../system/http'
+import { detailFields, headerFields, PERM_LABEL, TARGET_LABEL } from '../system/schema-service'
 import type { FormFieldPermission, FormSchema, ID, PermType, TargetType } from '../system/types'
-import { confirmAction, must, run, runAsync, toast } from '../utils/notify'
+import { confirmAction, must, runAsync, toast } from '../utils/notify'
 
 const route = useRoute()
-const templateId = ref<ID>((route.query.templateId as string) ?? db.form_template.find((t) => t.delFlag === 0)?.templateId ?? '')
+const board = ref<RemoteTemplateBoard | null>(null)
+const templateId = ref<ID>((route.query.templateId as string) ?? '')
 
-const templates = computed(() => db.form_template.filter((t) => t.delFlag === 0))
-const template = computed(() => db.form_template.find((t) => t.templateId === templateId.value))
-/** 可选字段：当前版本的基础字段 + 各子单位新增的独有字段标识 */
-const fieldKeys = computed(() => {
-  if (!template.value) return [] as { key: string; label: string }[]
-  const base = db.form_field
-    .filter((f) => f.templateId === templateId.value && f.version === template.value!.version && f.delFlag === 0)
-    .map((f) => ({ key: f.fieldKey, label: f.fieldLabel }))
-  const add = db.form_org_diff
-    .filter((d) => d.templateId === templateId.value && d.diffType === 3 && d.delFlag === 0)
-    .map((d) => ({ key: d.fieldKey, label: `${d.fieldLabel ?? d.fieldKey}（独有字段）` }))
-  const seen = new Set<string>()
-  return [...base, ...add].filter((x) => (seen.has(x.key) ? false : (seen.add(x.key), true)))
-})
+const templates = computed(() => board.value?.templates ?? [])
+const template = computed(() => templates.value.find((t) => t.templateId === templateId.value))
+const orgName = (id: string) => board.value?.orgs.find((o) => o.orgId === id)?.orgName ?? id
 
-const rules = computed(() => must(api.perm.list(templateId.value)))
+/** 可选字段：后端返回当前版本基础字段 + 各子单位独有字段标识 */
+const fieldKeys = ref<{ key: string; label: string }[]>([])
+const rules = ref<FormFieldPermission[]>([])
+
+async function loadFieldKeys() {
+  if (!templateId.value) {
+    fieldKeys.value = []
+    return
+  }
+  const r = await remote.permFieldKeys(templateId.value)
+  fieldKeys.value = r.code === 200 ? r.data : []
+}
+async function loadRules() {
+  if (!templateId.value) {
+    rules.value = []
+    return
+  }
+  const r = await remote.permList(templateId.value)
+  rules.value = r.code === 200 ? r.data : []
+}
 const filtered = computed(() => (draft.fieldKey ? rules.value.filter((r) => r.fieldKey === draft.fieldKey) : rules.value))
 
 function targetName(r: FormFieldPermission): string {
   switch (r.targetType) {
     case 1:
-      return db.sys_role.find((x) => x.roleId === r.targetId)?.roleName ?? r.targetId
+      return board.value?.roles.find((x) => x.roleId === r.targetId)?.roleName ?? r.targetId
     case 2:
-      return db.sys_dept.find((x) => x.deptId === r.targetId)?.deptName ?? r.targetId
+      return board.value?.depts.find((x) => x.deptId === r.targetId)?.deptName ?? r.targetId
     case 3:
-      return orgById(r.targetId)?.orgName ?? r.targetId
+      return orgName(r.targetId)
     case 4:
-      return db.sys_user.find((x) => x.userId === r.targetId)?.realName ?? r.targetId
+      return board.value?.users.find((x) => x.userId === r.targetId)?.realName ?? r.targetId
   }
 }
 
@@ -67,10 +75,11 @@ const editing = ref(false)
 
 /** 权限对象候选项随 targetType 切换 */
 const targetOptions = computed(() => {
-  if (draft.targetType === 1) return db.sys_role.filter((r) => r.status === 1).map((r) => ({ id: r.roleId, name: r.roleName }))
-  if (draft.targetType === 2) return db.sys_dept.filter((d) => d.delFlag === 0).map((d) => ({ id: d.deptId, name: `${orgById(d.orgId)?.orgName ?? ''} / ${d.deptName}` }))
-  if (draft.targetType === 3) return db.sys_org.filter((o) => o.orgLevel >= 2 && o.delFlag === 0).map((o) => ({ id: o.orgId, name: o.orgName }))
-  return db.sys_user.filter((u) => u.delFlag === 0).map((u) => ({ id: u.userId, name: `${u.realName}（${orgById(u.orgId)?.orgName ?? ''}）` }))
+  if (!board.value) return [] as { id: ID; name: string }[]
+  if (draft.targetType === 1) return board.value.roles.filter((r) => r.status === 1).map((r) => ({ id: r.roleId, name: r.roleName }))
+  if (draft.targetType === 2) return board.value.depts.filter((d) => d.delFlag === 0).map((d) => ({ id: d.deptId, name: `${orgName(d.orgId)} / ${d.deptName}` }))
+  if (draft.targetType === 3) return board.value.subOrgs.map((o) => ({ id: o.orgId, name: o.orgName }))
+  return board.value.users.map((u) => ({ id: u.userId, name: `${u.realName}（${orgName(u.orgId)}）` }))
 })
 
 function newRule() {
@@ -100,11 +109,11 @@ function editRule(r: FormFieldPermission) {
 }
 
 function save() {
-  run(() => {
+  void runAsync(async () => {
     if (!draft.fieldKey) throw new Error('请选择字段标识')
     if (!draft.targetId) throw new Error('请选择权限对象')
     must(
-      api.perm.save({
+      await remote.permSave({
         permId: draft.permId || undefined,
         templateId: templateId.value,
         fieldKey: draft.fieldKey,
@@ -117,7 +126,8 @@ function save() {
     )
     toast('ok', '权限规则已保存，Schema 缓存同步失效（7.2）')
     editing.value = false
-    refreshPreview()
+    await loadRules()
+    await refreshPreview()
   })
 }
 
@@ -128,9 +138,10 @@ function remove(r: FormFieldPermission) {
       '删除确认',
     )
     if (!yes) return
-    must(api.perm.remove(r.permId))
+    must(await remote.permRemove(r.permId))
     toast('ok', '规则已删除')
-    refreshPreview()
+    await loadRules()
+    await refreshPreview()
   })
 }
 
@@ -138,33 +149,17 @@ function remove(r: FormFieldPermission) {
 const viewUser = ref<ID>('U5')
 const viewOrg = ref<ID>('O11')
 const schema = ref<FormSchema | null>(null)
+const decision = ref<RemotePermDecisionRow[]>([])
 
-function refreshPreview() {
-  run(() => {
-    if (!template.value) return
-    schema.value = must(api.template.preview(templateId.value, template.value.version, viewOrg.value, viewUser.value))
-  })
+/** 服务端一次产出 Schema + 逐字段裁决行（不再本地 decidePerm） */
+async function refreshPreview() {
+  if (!template.value || !templateId.value) return
+  const r = await remote.permDecision(templateId.value, viewOrg.value, viewUser.value)
+  if (r.code === 200 && r.data) {
+    schema.value = r.data.schema
+    decision.value = r.data.rows
+  }
 }
-refreshPreview()
-
-/** 逐字段列出命中当前预览用户的规则与采纳结果（7.2 伪代码的表格化呈现） */
-const decision = computed(() => {
-  const u = db.sys_user.find((x) => x.userId === viewUser.value)
-  if (!u || !schema.value) return []
-  return schema.value.fields.map((f) => {
-    const d = decidePerm(f.fieldKey, u, templateId.value, f.isRequired)
-    return {
-      fieldKey: f.fieldKey,
-      label: f.fieldLabel,
-      perm: f.permission,
-      required: f.isRequired,
-      hit: d.hit ?? '无规则，默认 edit',
-      matched: d.matched,
-      systemValue: f.systemValue,
-      scope: f.config.scope === 'detail' ? '明细' : '单头',
-    }
-  })
-})
 
 const hiddenList = computed(() => schema.value?.hiddenKeys ?? [])
 
@@ -178,11 +173,28 @@ const SCENES = [
 function applyScene(s: (typeof SCENES)[number]) {
   viewUser.value = s.user
   viewOrg.value = s.org
-  refreshPreview()
+  void refreshPreview()
 }
 
 const headCount = computed(() => (schema.value ? headerFields(schema.value).length : 0))
 const detailCount = computed(() => (schema.value ? detailFields(schema.value).length : 0))
+
+async function load() {
+  const r = await remote.templateBoard()
+  board.value = r.code === 200 ? r.data : null
+  if (!templateId.value || !templates.value.some((t) => t.templateId === templateId.value)) {
+    templateId.value = templates.value[0]?.templateId ?? ''
+  }
+  await loadFieldKeys()
+  await loadRules()
+  await refreshPreview()
+}
+onMounted(() => void load())
+watch(templateId, () => {
+  void loadFieldKeys()
+  void loadRules()
+  void refreshPreview()
+})
 </script>
 
 <template>
@@ -292,15 +304,15 @@ const detailCount = computed(() => (schema.value ? detailFields(schema.value).le
             <span class="muted">用户</span>
             <el-select v-model="viewUser" filterable style="width: 220px" @change="refreshPreview">
               <el-option
-                v-for="u in db.sys_user.filter((x) => x.delFlag === 0)"
+                v-for="u in board?.users ?? []"
                 :key="u.userId"
-                :label="`${u.realName}（${orgById(u.orgId)?.orgName}）`"
+                :label="`${u.realName}（${orgName(u.orgId)}）`"
                 :value="u.userId"
               />
             </el-select>
             <span class="muted">单位视图</span>
             <el-select v-model="viewOrg" style="width: 200px" @change="refreshPreview">
-              <el-option v-for="o in db.sys_org.filter((x) => x.orgLevel >= 2 && x.delFlag === 0)" :key="o.orgId" :label="o.orgName" :value="o.orgId" />
+              <el-option v-for="o in board?.subOrgs ?? []" :key="o.orgId" :label="o.orgName" :value="o.orgId" />
             </el-select>
             <span class="spacer" />
             <el-tag size="small" type="info">单头 {{ headCount }}</el-tag>

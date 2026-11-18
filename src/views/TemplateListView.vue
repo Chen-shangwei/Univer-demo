@@ -3,22 +3,23 @@
  * 3.2 表单模板管理：模板台账、状态流转、版本发布。
  * 字段配置在本页「配置字段」跳转至 /template/edit 完成。
  */
-import { computed, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { Plus } from '@element-plus/icons-vue'
 import type { FormInstance, FormRules } from 'element-plus'
-import { api } from '../system/api'
-import { db, orgById, userById } from '../system/db'
-import { must, run, toast } from '../utils/notify'
+import { remote, type RemoteTemplateBoard, type RemoteTemplateDetail, type RemoteTemplateRow } from '../system/http'
+import { must, runAsync, toast } from '../utils/notify'
 
 const router = useRouter()
 const TPL_STATUS_TEXT = ['草稿', '启用', '停用', '归档']
-const bizTypes = computed(() => db.sys_dict.filter((d) => d.dictCode === 'BIZ_TYPE'))
 
-const list = computed(() => db.form_template.filter((t) => t.delFlag === 0))
+/** 后台读模型：台账/字典/最近变更一次取回，视图不再回查本地 db */
+const board = ref<RemoteTemplateBoard | null>(null)
+const bizTypes = computed(() => board.value?.bizTypes ?? [])
+const list = computed<RemoteTemplateRow[]>(() => board.value?.templates ?? [])
+
 const selected = ref<string>('')
-
-const detail = computed(() => (selected.value ? must(api.template.detail(selected.value)) : null))
+const detail = ref<RemoteTemplateDetail | null>(null)
 
 const formRef = ref<FormInstance>()
 const form = reactive({ templateId: '', templateName: '', templateDesc: '', bizType: '' })
@@ -29,50 +30,61 @@ const editing = ref(false)
 const publishOpen = ref(false)
 const publishSummary = ref('')
 
+async function loadDetail(id: string) {
+  if (!id) {
+    detail.value = null
+    return
+  }
+  const r = await remote.templateDetail(id)
+  detail.value = r.code === 200 ? r.data : null
+}
+
+async function load(keepSelection = true) {
+  const r = await remote.templateBoard()
+  board.value = r.code === 200 ? r.data : null
+  if (keepSelection && selected.value && list.value.some((t) => t.templateId === selected.value)) {
+    await loadDetail(selected.value)
+  } else {
+    selected.value = list.value[0]?.templateId ?? ''
+    await loadDetail(selected.value)
+  }
+}
+onMounted(() => void load(false))
+
 function create() {
   Object.assign(form, { templateId: '', templateName: '', templateDesc: '', bizType: bizTypes.value[0]?.value ?? '' })
   editing.value = true
 }
 
-function edit(t: (typeof list.value)[number]) {
-  Object.assign(form, {
-    templateId: t.templateId,
-    templateName: t.templateName,
-    templateDesc: t.templateDesc,
-    bizType: t.bizType,
-  })
+function edit(t: RemoteTemplateRow) {
+  Object.assign(form, { templateId: t.templateId, templateName: t.templateName, templateDesc: t.templateDesc, bizType: t.bizType })
   editing.value = true
 }
 
-async function save() {
-  if (!(await formRef.value?.validate().catch(() => false))) return
-  run(() => {
-    const id = must(api.template.save({ ...form, templateId: form.templateId || undefined }))
+function save() {
+  void runAsync(async () => {
+    if (!(await formRef.value?.validate().catch(() => false))) return
+    const id = must(await remote.templateSave({ ...form, templateId: form.templateId || undefined }))
     selected.value = id
+    await load()
     toast('ok', '模板已保存，可继续配置字段')
     editing.value = false
   })
 }
 
-function setStatus(t: (typeof list.value)[number], status: 0 | 1 | 2 | 3) {
-  run(() => {
-    must(api.template.status(t.templateId, status))
+function setStatus(t: { templateId: string; templateName: string }, status: 0 | 1 | 2 | 3) {
+  void runAsync(async () => {
+    must(await remote.templateStatus(t.templateId, status))
+    await load()
     toast('ok', `「${t.templateName}」已置为${TPL_STATUS_TEXT[status]}`)
   })
 }
 
-function fieldCount(id: string, version: string) {
-  return db.form_field.filter((f) => f.templateId === id && f.version === version && f.delFlag === 0).length
-}
-
-function taskCount(id: string) {
-  return db.form_task.filter((t) => t.templateId === id && t.delFlag === 0).length
-}
-
 function publish() {
-  run(() => {
+  void runAsync(async () => {
     if (!selected.value) throw new Error('请先选择模板')
-    const v = must(api.template.publishVersion(selected.value, publishSummary.value))
+    const v = must(await remote.templatePublishVersion(selected.value, publishSummary.value))
+    await load()
     toast('ok', `已发布 ${v}，历史记录仍按原版本呈现（7.3）`)
     publishOpen.value = false
     publishSummary.value = ''
@@ -85,15 +97,15 @@ function tplTag(status: number): 'success' | 'warning' | 'info' {
 }
 
 function pickRow(row: { templateId?: string } | null) {
-  if (row?.templateId) selected.value = row.templateId
+  if (row?.templateId) {
+    selected.value = row.templateId
+    void loadDetail(row.templateId)
+  }
 }
 
 function go(path: string, templateId: string) {
   router.push({ path, query: { templateId } })
 }
-
-const orgName = (id: string) => orgById(id)?.orgName ?? '—'
-const userName = (id?: string) => (id ? (userById(id)?.realName ?? id) : '—')
 </script>
 
 <template>
@@ -130,10 +142,10 @@ const userName = (id?: string) => (id ? (userById(id)?.realName ?? id) : '—')
               <template #default="{ row }"><span class="mono">{{ row.version }}</span></template>
             </el-table-column>
             <el-table-column label="字段数" width="80" align="right">
-              <template #default="{ row }">{{ fieldCount(row.templateId, row.version) }}</template>
+              <template #default="{ row }">{{ row.fieldCount }}</template>
             </el-table-column>
             <el-table-column label="关联任务" width="90" align="right">
-              <template #default="{ row }">{{ taskCount(row.templateId) }}</template>
+              <template #default="{ row }">{{ row.taskCount }}</template>
             </el-table-column>
             <el-table-column label="状态" width="90" align="center">
               <template #default="{ row }">
@@ -145,7 +157,7 @@ const userName = (id?: string) => (id ? (userById(id)?.realName ?? id) : '—')
                 <el-button link type="primary" @click.stop="go('/template/edit', row.templateId)">配置字段</el-button>
                 <el-button link type="primary" @click.stop="go('/template/diff', row.templateId)">差异化</el-button>
                 <el-button link type="primary" @click.stop="go('/template/perm', row.templateId)">权限</el-button>
-                <el-button link @click.stop="edit(row as (typeof list)[number])">编辑</el-button>
+                <el-button link @click.stop="edit(row as RemoteTemplateRow)">编辑</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -176,7 +188,7 @@ const userName = (id?: string) => (id ? (userById(id)?.realName ?? id) : '—')
               <template #default="{ row }">{{ row.fields.length }}</template>
             </el-table-column>
           </el-table>
-          <p class="flow-hint" style="margin: 12px 0 0">创建单位：{{ orgName(detail.template.createOrgId) }}</p>
+          <p class="flow-hint" style="margin: 12px 0 0">创建单位：{{ detail.createOrgName }}</p>
         </div>
       </div>
 
@@ -194,14 +206,14 @@ const userName = (id?: string) => (id ? (userById(id)?.realName ?? id) : '—')
           <h3>最近模板变更（3.10）</h3>
           <el-timeline>
             <el-timeline-item
-              v-for="l in db.form_oper_log.filter((x) => x.bizType === 'template').slice(0, 6)"
+              v-for="l in board?.operLogs ?? []"
               :key="l.logId"
               :timestamp="l.operTime"
               placement="top"
             >
               <div class="t-hd">{{ l.operType }}</div>
               <div class="muted">{{ l.content }}</div>
-              <div class="t-meta">{{ userName(l.userId) }}</div>
+              <div class="t-meta">{{ l.userName }}</div>
             </el-timeline-item>
           </el-timeline>
         </div>

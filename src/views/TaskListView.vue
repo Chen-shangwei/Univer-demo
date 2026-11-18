@@ -3,13 +3,13 @@
  * 3.5 填报任务管理：创建任务、绑定模板版本、设定周期与审核方式、选择下发范围、发布与归档。
  * 9.2 定时任务口径在「发布 / 刷新状态」时同步执行，用于演示状态推进与临期催办。
  */
-import { computed, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { Delete, EditPen, Plus } from '@element-plus/icons-vue'
-import { api } from '../system/api'
-import { db, orgById, scopeOrgs, userName } from '../system/db'
-import type { AuditNode, FormTask, ID, RoleCode } from '../system/types'
-import { confirmAction, fmt, must, run, runAsync, toDateTimeInput, toast } from '../utils/notify'
+import { remote } from '../system/http'
+import type { RemoteTaskBoard, RemoteTaskRow } from '../system/http'
+import type { AuditNode, ID, RoleCode } from '../system/types'
+import { confirmAction, fmt, must, runAsync, toDateTimeInput, toast } from '../utils/notify'
 import { TASK_TAG } from '../utils/display'
 
 const router = useRouter()
@@ -21,18 +21,40 @@ function toTs(v: string): string {
   return v ? `${v.replace('T', ' ')}:00` : ''
 }
 
-const list = computed(() => must(api.task.list()).slice().sort((a, b) => b.taskId.localeCompare(a.taskId)))
-/** 3.2：草稿与停用模板不可下发，归档模板不出现在可选列表 */
-const usableTemplates = computed(() => db.form_template.filter((t) => t.delFlag === 0 && t.status === 1))
-const allOrgs = computed(() => db.sys_org.filter((o) => o.orgLevel >= 2 && o.status === 1 && o.delFlag === 0))
+const board = ref<RemoteTaskBoard | null>(null)
+const loading = ref(false)
+const list = computed<RemoteTaskRow[]>(() => board.value?.tasks.slice().sort((a, b) => b.taskId.localeCompare(a.taskId)) ?? [])
+/** 3.2：草稿与停用模板不可下发，归档模板不出现在可选列表（后台已按 status===1 过滤） */
+const usableTemplates = computed(() => board.value?.templates ?? [])
+const allOrgs = computed(() => board.value?.orgs ?? [])
+const roleOptions = computed(() => board.value?.roles ?? [])
+const userOptions = computed(() => board.value?.users ?? [])
 
 const selected = ref<ID>('')
 const current = computed(() => list.value.find((t) => t.taskId === selected.value) ?? null)
 const reminds = ref<string[]>([])
 
-function recordCount(taskId: ID) {
-  return db.form_record.filter((r) => r.taskId === taskId && r.delFlag === 0).length
+const userNames = computed(() => new Map(userOptions.value.map((u) => [u.userId, u.realName])))
+const roleNames = computed(() => new Map(roleOptions.value.map((r) => [r.roleCode, r.roleName])))
+const nameOf = (id?: ID) => (id ? userNames.value.get(id) ?? id : '—')
+
+/** 唯一数据源：一次拉全任务台账 + 字典；临期催办随读刷新 */
+async function load(keepSelection = true) {
+  loading.value = true
+  try {
+    const r = await remote.taskBoard()
+    if (r.code === 200 && r.data) {
+      board.value = r.data
+      reminds.value = r.data.reminds
+      if (!keepSelection || !r.data.tasks.some((t) => t.taskId === selected.value)) selected.value = ''
+    } else {
+      toast('err', r.msg)
+    }
+  } finally {
+    loading.value = false
+  }
 }
+onMounted(() => void load(false))
 
 /* ------------------------------------------------ 任务表单 */
 const form = reactive({
@@ -66,7 +88,7 @@ function createNew() {
   formOpen.value = true
 }
 
-function edit(t: FormTask) {
+function edit(t: RemoteTaskRow) {
   Object.assign(form, {
     taskId: t.taskId,
     taskName: t.taskName,
@@ -76,7 +98,7 @@ function edit(t: FormTask) {
     auditType: t.auditType,
     singleRecordPerOrg: t.singleRecordPerOrg,
     remindDays: t.remindDays ?? 0,
-    orgIds: scopeOrgs(t.taskId).map((o) => o.orgId),
+    orgIds: [...t.scopeOrgIds],
   })
   nodes.value = structuredClone(t.auditNodes)
   formOpen.value = true
@@ -113,7 +135,7 @@ function nodeUserSet(i: number, v: string) {
 }
 
 function save() {
-  run(() => {
+  void runAsync(async () => {
     if (!form.taskName.trim()) throw new Error('任务名称必填')
     if (!form.templateId) throw new Error('请选择填报模板')
     if (!form.startAt || !form.endAt) throw new Error('填报周期必填')
@@ -126,7 +148,7 @@ function save() {
       if (noAuditor) throw new Error(`节点「${noAuditor.nodeName || '未命名'}」需指定审核人或审核角色`)
     }
     const taskId = must(
-      api.task.create({
+      await remote.taskCreate({
         taskId: form.taskId || undefined,
         taskName: form.taskName.trim(),
         templateId: form.templateId,
@@ -140,56 +162,61 @@ function save() {
       }),
     )
     selected.value = taskId
-    toast('ok', `任务已保存，绑定模板版本 ${db.form_task.find((t) => t.taskId === taskId)?.templateVersion}（7.3 发布即冻结）`)
+    await load()
+    toast('ok', `任务已保存，绑定模板版本 ${board.value?.tasks.find((t) => t.taskId === taskId)?.templateVersion}（7.3 发布即冻结）`)
     formOpen.value = false
   })
 }
 
 /* ------------------------------------------------ 状态动作 */
-function publish(t: FormTask) {
-  run(() => {
-    const r = must(api.task.publish(t.taskId))
+function publish(t: RemoteTaskRow) {
+  void runAsync(async () => {
+    const r = must(await remote.taskPublish(t.taskId))
     reminds.value = r.reminds
-    toast('ok', `已发布「${t.taskName}」，状态 ${STATUS_TEXT[r.status]}，推进 ${r.changed} 个任务`)
+    toast('ok', `已发布「${t.taskName}」，状态 ${STATUS_TEXT[r.status as 0 | 1 | 2 | 3]}，推进 ${r.changed} 个任务`)
+    await load()
   })
 }
 
-function archive(t: FormTask) {
+function archive(t: RemoteTaskRow) {
   void runAsync(async () => {
     const yes = await confirmAction(`归档「${t.taskName}」？归档后任务与数据均为只读，操作日志继续保留（3.5）`, '归档确认')
     if (!yes) return
-    must(api.task.archive(t.taskId))
+    must(await remote.taskArchive(t.taskId))
     toast('ok', '任务已归档')
+    await load()
   })
 }
 
 function refreshState() {
-  run(() => {
-    const r = must(api.task.tick())
+  void runAsync(async () => {
+    const r = must(await remote.taskTick())
     reminds.value = r.reminds
     toast('ok', `已按当前时间推进 ${r.changed} 个任务状态`)
+    await load()
   })
 }
 
 const scopeDraft = ref<ID[]>([])
-function openScope(t: FormTask) {
+function openScope(t: RemoteTaskRow) {
   selected.value = t.taskId
-  scopeDraft.value = scopeOrgs(t.taskId).map((o) => o.orgId)
+  scopeDraft.value = [...t.scopeOrgIds]
 }
 function applyScope() {
   const t = current.value
   if (!t) return
-  run(() => {
-    must(api.task.scopeSave(t.taskId, scopeDraft.value))
+  void runAsync(async () => {
+    must(await remote.taskScopeSave(t.taskId, scopeDraft.value))
     toast('ok', `下发范围已更新为 ${scopeDraft.value.length} 个单位`)
+    await load()
   })
 }
 
-const nodeText = (t: FormTask) =>
-  t.auditNodes.map((n) => `${n.seq}.${n.nodeName}（${n.userId ? userName(n.userId) : n.roleCode ? db.sys_role.find((r) => r.roleCode === n.roleCode)?.roleName : '未配置'}）`).join(' → ') || '—'
+const nodeText = (t: RemoteTaskRow) =>
+  t.auditNodes.map((n) => `${n.seq}.${n.nodeName}（${n.userId ? nameOf(n.userId) : n.roleCode ? roleNames.value.get(n.roleCode) ?? n.roleCode : '未配置'}）`).join(' → ') || '—'
 
-/** 选中行回调的行已是 FormTask（el-table 会从 :data 推导行类型） */
-function pickRow(row: FormTask | null) {
+/** 选中行回调的行已是台账行（el-table 会从 :data 推导行类型） */
+function pickRow(row: RemoteTaskRow | null) {
   if (row) selected.value = row.taskId
 }
 </script>
@@ -235,7 +262,7 @@ function pickRow(row: FormTask | null) {
             </el-table-column>
             <el-table-column label="模板 / 版本" min-width="170">
               <template #default="{ row }">
-                <span class="muted">{{ db.form_template.find((x) => x.templateId === row.templateId)?.templateName }} · <span class="mono">{{ row.templateVersion }}</span></span>
+                <span class="muted">{{ row.templateName }} · <span class="mono">{{ row.templateVersion }}</span></span>
               </template>
             </el-table-column>
             <el-table-column label="填报周期" width="190">
@@ -250,17 +277,17 @@ function pickRow(row: FormTask | null) {
               <template #default="{ row }">{{ AUDIT_TEXT[row.auditType as number] }}</template>
             </el-table-column>
             <el-table-column label="范围" width="64" align="right">
-              <template #default="{ row }">{{ scopeOrgs(row.taskId as ID).length }}</template>
+              <template #default="{ row }">{{ row.scopeOrgIds.length }}</template>
             </el-table-column>
             <el-table-column label="记录" width="64" align="right">
-              <template #default="{ row }">{{ recordCount(row.taskId as ID) }}</template>
+              <template #default="{ row }">{{ row.recordCount }}</template>
             </el-table-column>
             <el-table-column label="操作" width="230" align="right">
               <template #default="{ row }">
-                <el-button link type="primary" :icon="EditPen" @click.stop="edit(row as FormTask)">编辑</el-button>
-                <el-button link type="primary" @click.stop="openScope(row as FormTask)">范围</el-button>
-                <el-button v-if="row.status !== 3" link type="primary" @click.stop="publish(row as FormTask)">发布</el-button>
-                <el-button v-if="row.status !== 3" link type="danger" @click.stop="archive(row as FormTask)">归档</el-button>
+                <el-button link type="primary" :icon="EditPen" @click.stop="edit(row as RemoteTaskRow)">编辑</el-button>
+                <el-button link type="primary" @click.stop="openScope(row as RemoteTaskRow)">范围</el-button>
+                <el-button v-if="row.status !== 3" link type="primary" @click.stop="publish(row as RemoteTaskRow)">发布</el-button>
+                <el-button v-if="row.status !== 3" link type="danger" @click.stop="archive(row as RemoteTaskRow)">归档</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -311,11 +338,11 @@ function pickRow(row: FormTask | null) {
               <el-input v-model="n.nodeName" placeholder="节点名称，如 子单位初审" class="node-name" />
               <el-select :model-value="nodeRoleVal(i)" class="node-target" @update:model-value="(v) => nodeRoleSet(i, String(v))">
                 <el-option label="未配置" :value="NONE" />
-                <el-option v-for="r in db.sys_role.filter((x) => x.status === 1)" :key="r.roleId" :label="r.roleName" :value="r.roleCode" />
+                <el-option v-for="r in roleOptions" :key="r.roleId" :label="r.roleName" :value="r.roleCode" />
               </el-select>
               <el-select :model-value="nodeUserVal(i)" class="node-target" filterable @update:model-value="(v) => nodeUserSet(i, String(v))">
                 <el-option label="不限定具体人" :value="NONE" />
-                <el-option v-for="u in db.sys_user.filter((x) => x.delFlag === 0 && x.status === 1)" :key="u.userId" :label="u.realName" :value="u.userId" />
+                <el-option v-for="u in userOptions" :key="u.userId" :label="u.realName" :value="u.userId" />
               </el-select>
               <el-button link type="danger" :icon="Delete" @click="removeNode(i)">删</el-button>
             </div>
@@ -344,10 +371,10 @@ function pickRow(row: FormTask | null) {
               <span class="mono">{{ current.templateVersion }}</span>（任务发布时冻结，历史记录按此呈现，7.3）
             </el-descriptions-item>
             <el-descriptions-item label="审核链路">{{ nodeText(current) }}</el-descriptions-item>
-            <el-descriptions-item label="下发单位">{{ scopeOrgs(current.taskId).map((o) => o.orgName).join('、') || '—' }}</el-descriptions-item>
-            <el-descriptions-item label="发布单位">{{ orgById(current.publishOrgId)?.orgName }}</el-descriptions-item>
+            <el-descriptions-item label="下发单位">{{ current.scopeOrgNames.join('、') || '—' }}</el-descriptions-item>
+            <el-descriptions-item label="发布单位">{{ current.publishOrgName }}</el-descriptions-item>
             <el-descriptions-item label="创建人 / 时间">
-              <span class="muted">{{ current.createdBy ? userName(current.createdBy) : '—' }} · {{ current.createTime }}</span>
+              <span class="muted">{{ current.createdByName ?? '—' }} · {{ current.createTime }}</span>
             </el-descriptions-item>
           </el-descriptions>
 
@@ -380,10 +407,10 @@ function pickRow(row: FormTask | null) {
               <template #default="{ row }">{{ row.taskName.slice(0, 14) }}…</template>
             </el-table-column>
             <el-table-column label="已提交" width="76" align="right">
-              <template #default="{ row }">{{ db.form_record.filter((r) => r.taskId === row.taskId && r.recordStatus !== 'draft').length }}</template>
+              <template #default="{ row }">{{ row.submittedCount }}</template>
             </el-table-column>
             <el-table-column label="未填报" width="76" align="right">
-              <template #default="{ row }">{{ Math.max(scopeOrgs(row.taskId as ID).length - new Set(db.form_record.filter((r) => r.taskId === row.taskId).map((r) => r.orgId)).size, 0) }}</template>
+              <template #default="{ row }">{{ Math.max(row.scopeOrgIds.length - row.reportedOrgCount, 0) }}</template>
             </el-table-column>
           </el-table>
         </div>

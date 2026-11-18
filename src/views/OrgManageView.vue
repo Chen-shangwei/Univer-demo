@@ -3,18 +3,25 @@
  * 3.1 组织与用户管理：单位树、部门、用户（一人多角色）。
  * 仅系统管理员可维护（表 31），其余角色由路由守卫挡在门外。
  */
-import { computed, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { Search } from '@element-plus/icons-vue'
-import { api } from '../system/api'
-import { db, rolesOf } from '../system/db'
+import { remote } from '../system/http'
+import type { RemoteOrgBoard } from '../system/http'
 import type { OrgNode } from '../system/service'
 import { ROLE_LABEL } from '../system/schema-service'
 import { ROLE } from '../system/types'
 import type { ID, SysDept, SysOrg, SysUser } from '../system/types'
-import { must, run, toast } from '../utils/notify'
+import { confirmAction, must, runAsync, toast } from '../utils/notify'
 
-const selectedOrg = ref<ID>(db.sys_org.find((o) => o.parentId === '0' && o.delFlag === 0)?.orgId ?? 'O1')
-const orgNodes = computed<OrgNode[]>(() => must(api.org.tree()))
+/** 3.1 全部动态数据来自后台 orgBoard；selectedOrg 在首帧加载后回填 */
+const board = ref<RemoteOrgBoard | null>(null)
+const loading = ref(false)
+const allOrgs = computed<SysOrg[]>(() => board.value?.orgs ?? [])
+const allDepts = computed<SysDept[]>(() => board.value?.depts ?? [])
+const allUsers = computed<SysUser[]>(() => board.value?.users ?? [])
+
+const selectedOrg = ref<ID>('')
+const orgNodes = computed<OrgNode[]>(() => board.value?.tree ?? [])
 
 interface OrgOption {
   org: SysOrg
@@ -56,22 +63,22 @@ function pickNode(data: OrgTreeNode) {
   selectedOrg.value = data.key
 }
 
-const orgDepts = computed(() => db.sys_dept.filter((d) => d.orgId === selectedOrg.value && d.delFlag === 0))
-const orgUsers = computed(() => db.sys_user.filter((u) => u.orgId === selectedOrg.value && u.delFlag === 0))
+const orgDepts = computed(() => allDepts.value.filter((d) => d.orgId === selectedOrg.value))
+const orgUsers = computed(() => allUsers.value.filter((u) => u.orgId === selectedOrg.value))
 
 /* ----------------------------------------------- 单位编辑 */
 const orgForm = reactive({ orgId: '', orgName: '', orgCode: '', parentId: '0', orgLevel: 2 as 1 | 2 | 3, sort: 1, status: 1 as 0 | 1 })
 const editingOrg = ref(false)
 
 function newOrg() {
-  const parent = db.sys_org.find((o) => o.orgId === selectedOrg.value)
+  const parent = allOrgs.value.find((o) => o.orgId === selectedOrg.value)
   Object.assign(orgForm, {
     orgId: '',
     orgName: '',
     orgCode: '',
     parentId: parent?.orgId ?? '0',
     orgLevel: (Math.min(3, (parent?.orgLevel ?? 0) + 1) as 1 | 2 | 3),
-    sort: db.sys_org.filter((o) => o.parentId === parent?.orgId && o.delFlag === 0).length + 1,
+    sort: allOrgs.value.filter((o) => o.parentId === parent?.orgId).length + 1,
     status: 1,
   })
   editingOrg.value = true
@@ -82,11 +89,26 @@ function editOrg(o: SysOrg) {
   editingOrg.value = true
 }
 
+/** 删除单位：二次确认后调后台；有下级/填报数据时后台拒绝，must 会把原因弹给用户 */
+async function removeOrgNode(o: SysOrg) {
+  const confirmed = await confirmAction(
+    `确认删除单位「${o.orgName}」？删除后其下部门与账号一并停用，且不可恢复。`,
+    '删除单位',
+  )
+  if (!confirmed) return
+  void runAsync(async () => {
+    must(await remote.orgRemove(o.orgId))
+    toast('ok', '单位已删除')
+    await load()
+  })
+}
+
 function saveOrg() {
-  run(() => {
-    must(api.org.save({ ...orgForm, orgId: orgForm.orgId || undefined }))
+  void runAsync(async () => {
+    must(await remote.orgSave({ ...orgForm, orgId: orgForm.orgId || undefined }))
     toast('ok', '单位已保存')
     editingOrg.value = false
+    await load()
   })
 }
 
@@ -105,10 +127,11 @@ function editDept(d: SysDept) {
 }
 
 function saveDept() {
-  run(() => {
-    must(api.org.deptSave({ ...deptForm, deptId: deptForm.deptId || undefined }))
+  void runAsync(async () => {
+    must(await remote.orgDeptSave({ ...deptForm, deptId: deptForm.deptId || undefined }))
     toast('ok', '部门已保存')
     editingDept.value = false
+    await load()
   })
 }
 
@@ -128,14 +151,19 @@ const keyword = ref('')
 const pageNum = ref(1)
 
 const USER_PAGE_SIZE = 10
-const userPage = computed(() =>
-  must(api.org.userPage({ pageNum: pageNum.value, pageSize: USER_PAGE_SIZE, keyword: keyword.value || undefined })),
-)
+const userPage = ref<{ total: number; pages: number; list: SysUser[] }>({ total: 0, pages: 1, list: [] })
 
-const roleList = computed(() => db.sys_role.filter((r) => r.delFlag === 0))
+async function loadUsers() {
+  const r = await remote.userPage({ pageNum: pageNum.value, pageSize: USER_PAGE_SIZE, keyword: keyword.value || undefined })
+  if (r.code === 200 && r.data) userPage.value = r.data
+  else toast('err', r.msg)
+}
+watch([keyword, pageNum], () => void loadUsers())
+
+const roleList = computed(() => board.value?.roles ?? [])
 
 /** 用户表单里的部门下拉跟随所选单位联动 */
-const userDeptOptions = computed(() => db.sys_dept.filter((x) => x.orgId === userForm.orgId && x.delFlag === 0))
+const userDeptOptions = computed(() => allDepts.value.filter((x) => x.orgId === userForm.orgId))
 
 function newUser() {
   Object.assign(userForm, {
@@ -158,23 +186,45 @@ function editUser(u: SysUser) {
 }
 
 function saveUser() {
-  run(() => {
+  void runAsync(async () => {
     if (!userForm.username || !userForm.realName) throw new Error('登录账号与姓名必填')
     if (!userForm.roleIds.length) throw new Error('至少选择一个角色（3.1 支持一人多角色）')
-    must(api.org.userSave({ ...userForm, userId: userForm.userId || undefined }))
+    must(await remote.userSave({ ...userForm, userId: userForm.userId || undefined }))
     toast('ok', '用户已保存')
     editingUser.value = false
+    await load()
   })
 }
 
 function roleText(u: SysUser) {
-  return rolesOf(u)
-    .map((r) => ROLE_LABEL[r])
+  return roleList.value
+    .filter((r) => u.roleIds.includes(r.roleId))
+    .map((r) => ROLE_LABEL[r.roleCode])
     .join(' / ')
 }
 
-const orgOf = (id: ID) => db.sys_org.find((o) => o.orgId === id)?.orgName ?? '—'
-const deptOf = (id: ID) => db.sys_dept.find((d) => d.deptId === id)?.deptName ?? '—'
+const orgOf = (id: ID) => allOrgs.value.find((o) => o.orgId === id)?.orgName ?? '—'
+const deptOf = (id: ID) => allDepts.value.find((d) => d.deptId === id)?.deptName ?? '—'
+
+/** 组织管理唯一数据源：一次拉全 board，再刷新分页用户 */
+async function load() {
+  loading.value = true
+  try {
+    const r = await remote.orgBoard()
+    if (r.code === 200 && r.data) {
+      board.value = r.data
+      if (!selectedOrg.value || !r.data.orgs.some((o) => o.orgId === selectedOrg.value)) {
+        selectedOrg.value = r.data.orgs.find((o) => o.parentId === '0')?.orgId ?? r.data.orgs[0]?.orgId ?? 'O1'
+      }
+    } else {
+      toast('err', r.msg)
+    }
+    await loadUsers()
+  } finally {
+    loading.value = false
+  }
+}
+onMounted(() => void load())
 </script>
 
 <template>
@@ -204,6 +254,7 @@ const deptOf = (id: ID) => db.sys_dept.find((d) => d.deptId === id)?.deptName ??
                 <span class="tname">{{ data.label }}</span>
                 <span class="muted mono">L{{ data.level }}</span>
                 <el-button link type="primary" @click.stop="editOrg(data.org)">编辑</el-button>
+                <el-button link type="danger" @click.stop="removeOrgNode(data.org)">删除</el-button>
               </span>
             </template>
           </el-tree>

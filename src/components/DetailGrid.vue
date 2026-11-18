@@ -7,7 +7,7 @@
  *   edit    → 正常可编辑
  * 拦截只是体验层：sync() 仍如实回抽网格现值，最终裁决在 8.2 的 enforceAuthority。
  */
-import { onBeforeUnmount, onMounted, shallowRef } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 import { CustomCommandExecutionError, ICommandService, LocaleType, Univer, UniverInstanceType, mergeLocales } from '@univerjs/core'
 import type { ICellData, IRange, IWorkbookData, Workbook } from '@univerjs/core'
 import zhCNDesignLocale from '@univerjs/design/locale/zh-CN'
@@ -25,11 +25,14 @@ import { PasteCommand, UniverUIPlugin } from '@univerjs/ui'
 import { UniverDocsPlugin } from '@univerjs/docs'
 import { UniverDocsUIPlugin } from '@univerjs/docs-ui'
 import { ClearSelectionAllCommand, ClearSelectionContentCommand, SetRangeValuesCommand, SheetsSelectionsService, UniverSheetsPlugin } from '@univerjs/sheets'
-import { SetCellEditVisibleOperation, UniverSheetsUIPlugin } from '@univerjs/sheets-ui'
+import { SetCellEditVisibleOperation, SetZoomRatioCommand, UniverSheetsUIPlugin } from '@univerjs/sheets-ui'
 import { UniverSheetsFormulaPlugin } from '@univerjs/sheets-formula'
 import { UniverSheetsFormulaUIPlugin } from '@univerjs/sheets-formula-ui'
 import { UniverSheetsNumfmtPlugin } from '@univerjs/sheets-numfmt'
 import { UniverSheetsNumfmtUIPlugin } from '@univerjs/sheets-numfmt-ui'
+import { FUniver } from '@univerjs/core/facade'
+import '@univerjs/sheets/facade'
+import '@univerjs/sheets-ui/facade'
 import { isEditable } from '../system/schema-service'
 import type { FieldValue, SchemaField } from '../system/types'
 import { toast } from '../utils/notify'
@@ -52,6 +55,82 @@ const SPARE_ROWS = 8
 const hostEl = shallowRef<HTMLElement | null>(null)
 const univer = shallowRef<Univer | null>(null)
 const workbook = shallowRef<Workbook | null>(null)
+const cmdSvc = shallowRef<ICommandService | null>(null)
+const univerAPI = shallowRef<FUniver | null>(null)
+
+/* ---------------------------------------- 主题（Facade API useThemeStyle） */
+const THEME_STORAGE_KEY = 'zn.tb.gridTheme'
+const currentTheme = ref<string>(localStorage.getItem(THEME_STORAGE_KEY) || '')
+
+const THEMES: { group: string; items: { label: string; value: string }[] }[] = [
+  { group: '内置', items: [
+    { label: '默认蓝', value: 'default' },
+    { label: '蓝底合计行', value: 'default-last-row' },
+  ]},
+  { group: '浅色系', items: [
+    { label: '浅蓝', value: 'light-blue' },
+    { label: '浅绿', value: 'light-green' },
+    { label: '浅橙', value: 'light-orange' },
+    { label: '浅紫', value: 'light-purple' },
+  ]},
+  { group: '中色系', items: [
+    { label: '中蓝', value: 'middle-blue' },
+    { label: '中绿', value: 'middle-green' },
+    { label: '中红', value: 'middle-red' },
+  ]},
+  { group: '深色系', items: [
+    { label: '深蓝', value: 'dark-blue' },
+    { label: '深绿', value: 'dark-green' },
+    { label: '深橙', value: 'dark-orange' },
+  ]},
+]
+
+function applyTheme(name?: string): void {
+  const fWorkbook = univerAPI.value?.getActiveWorkbook()
+  if (!fWorkbook) return
+  const fWorksheet = fWorkbook.getActiveSheet()
+  if (!fWorksheet) return
+  const rowCount = props.rows.length + SPARE_ROWS + 1
+  const colCount = Math.max(props.fields.length, 1)
+  const fRange = fWorksheet.getRange(0, 0, rowCount, colCount)
+  fRange.useThemeStyle(name || undefined)
+}
+
+watch(currentTheme, (name) => {
+  localStorage.setItem(THEME_STORAGE_KEY, name)
+  applyTheme(name)
+})
+
+/* ---------------------------------------- 全屏 + 缩放（保留 Univer 自带工具栏，不改外观） */
+const MIN_ZOOM = 0.5
+const MAX_ZOOM = 2
+const fullscreen = ref(false)
+const zoom = ref(1)
+const zoomPct = computed(() => Math.round(zoom.value * 100))
+
+function applyZoom(next: number) {
+  const z = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.round(next * 100) / 100))
+  zoom.value = z
+  // Univer 1.4 原生缩放：按 unit/subUnit 定位当前工作表
+  cmdSvc.value?.executeCommand(SetZoomRatioCommand.id, { unitId: WB_ID, subUnitId: SHEET_ID, zoomRatio: z })
+}
+const zoomIn = () => applyZoom(zoom.value + 0.1)
+const zoomOut = () => applyZoom(zoom.value - 0.1)
+const zoomReset = () => applyZoom(1)
+
+async function toggleFullscreen() {
+  fullscreen.value = !fullscreen.value
+  await nextTick()
+  // 容器尺寸变化，Univer 的 ResizeObserver 通常会自排；广播一次 resize 作兑底
+  window.dispatchEvent(new Event('resize'))
+}
+function onGlobalKey(e: KeyboardEvent) {
+  if (e.key === 'Escape' && fullscreen.value) void toggleFullscreen()
+}
+watch(fullscreen, (v) => {
+  if (v) window.addEventListener('keydown', onGlobalKey)
+  else window.removeEventListener('keydown', onGlobalKey)
+})
 
 /** 只读列：无 edit 权限，或值由系统赋值 */
 function isRo(f: SchemaField) {
@@ -160,6 +239,38 @@ function cellPrimitive(v: unknown): unknown {
   return null
 }
 
+function pad2(n: number): string {
+  return String(n).padStart(2, '0')
+}
+
+/** Univer 装了 numfmt 后会把形如 2026-11-08 的输入自动识别为日期、底层存成序列号（天数），回抽需还原 */
+function serialToIso(serial: number, time: boolean): string | null {
+  if (!Number.isFinite(serial) || serial <= 0) return null
+  const ms = Math.round((serial - 25569) * 86400000) // 25569 = 1899-12-30 → 1970-01-01 的天数
+  const d = new Date(ms)
+  if (Number.isNaN(d.getTime())) return null
+  const date = `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`
+  return time ? `${date} ${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}` : date
+}
+
+/**
+ * 把网格里的日期形态统一成 6.4 校验要求的 yyyy-MM-dd[ HH:mm]：
+ * 数字→Univer 序列号还原；否则按日期解析后补零（兼容 2026/11/8、个位数）；再不行退回原串截断。
+ */
+function isoDate(s: string, time: boolean): FieldValue {
+  const asNum = Number(s)
+  if (s !== '' && Number.isFinite(asNum)) {
+    const iso = serialToIso(asNum, time)
+    if (iso) return iso
+  }
+  const d = new Date(s.replace(/-/g, '/').replace('T', ' '))
+  if (!Number.isNaN(d.getTime())) {
+    const date = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
+    return time ? `${date} ${pad2(d.getHours())}:${pad2(d.getMinutes())}` : date
+  }
+  return time ? s.replace('T', ' ').slice(0, 16) : s.slice(0, 10)
+}
+
 function valueOf(f: SchemaField, raw: unknown): FieldValue {
   const v = cellPrimitive(raw)
   if (v === null || v === undefined) return null
@@ -176,8 +287,8 @@ function valueOf(f: SchemaField, raw: unknown): FieldValue {
     const n = Number(s)
     return Number.isNaN(n) ? s : n
   }
-  if (f.fieldType === 'datetime') return s.replace('T', ' ').slice(0, 16)
-  if (f.fieldType === 'date') return s.slice(0, 10)
+  if (f.fieldType === 'datetime') return isoDate(s, true)
+  if (f.fieldType === 'date') return isoDate(s, false)
   return s
 }
 
@@ -292,7 +403,10 @@ function init() {
 
   univer.value = inst
   workbook.value = inst.createUnit<IWorkbookData, Workbook>(UniverInstanceType.UNIVER_SHEET, buildSnapshot())
+  cmdSvc.value = inst.__getInjector().get(ICommandService)
+  univerAPI.value = FUniver.newAPI(inst)
   guardReadonly(inst)
+  if (currentTheme.value) applyTheme(currentTheme.value)
 }
 
 /**
@@ -326,14 +440,36 @@ defineExpose({ sync, reload: init })
 onMounted(init)
 
 onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onGlobalKey)
+  univerAPI.value?.dispose()
+  univerAPI.value = null
   univer.value?.dispose()
   univer.value = null
   workbook.value = null
+  cmdSvc.value = null
 })
 </script>
 
 <template>
-  <div ref="hostEl" class="univer-host" :class="{ 'is-locked': locked }" />
+  <div class="dg-wrap" :class="{ 'is-fs': fullscreen }">
+    <div class="dg-bar">
+      <el-select v-model="currentTheme" size="small" placeholder="主题" class="dg-theme" clearable>
+        <el-option label="无主题" value="" />
+        <el-option-group v-for="g in THEMES" :key="g.group" :label="g.group">
+          <el-option v-for="t in g.items" :key="t.value" :label="t.label" :value="t.value" />
+        </el-option-group>
+      </el-select>
+      <span class="spacer" />
+      <div class="dg-zoom">
+        <el-button size="small" :disabled="zoom <= MIN_ZOOM" @click="zoomOut">－</el-button>
+        <span class="dg-zoom-val">{{ zoomPct }}%</span>
+        <el-button size="small" :disabled="zoom >= MAX_ZOOM" @click="zoomIn">＋</el-button>
+        <el-button size="small" text :disabled="zoom === 1" @click="zoomReset">重置</el-button>
+      </div>
+      <el-button size="small" type="primary" plain @click="toggleFullscreen">{{ fullscreen ? '退出全屏' : '全屏' }}</el-button>
+    </div>
+    <div ref="hostEl" class="univer-host" :class="{ 'is-locked': locked }" />
+  </div>
 </template>
 
 <style scoped>
@@ -350,5 +486,50 @@ onBeforeUnmount(() => {
 .is-locked :deep(*) {
   pointer-events: none !important;
   user-select: none !important;
+}
+
+/* 工具条：缩放 + 全屏（右侧） */
+.dg-wrap {
+  display: flex;
+  flex-direction: column;
+}
+
+.dg-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.dg-zoom {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.dg-zoom-val {
+  min-width: 46px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  color: var(--el-text-color-regular);
+}
+
+.dg-theme {
+  width: 120px;
+}
+
+/* 全屏遮罩：z-index 1000 低于 Univer 自身弹层（~1020-1420），ribbon 下拉/右键菜单仍可弹出 */
+.dg-wrap.is-fs {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: #fff;
+  padding: 10px 14px 14px;
+}
+
+.dg-wrap.is-fs .univer-host {
+  flex: 1;
+  height: auto;
+  border-radius: 0;
 }
 </style>

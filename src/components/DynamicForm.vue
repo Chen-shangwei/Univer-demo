@@ -80,12 +80,11 @@ function patch(key: string, v: FieldValue) {
         @update:model-value="patch(f.fieldKey, $event)"
       />
     </template>
-
     <el-empty
       v-if="!fields.length"
+      class="field-empty"
       description="当前账号在单头区没有任何可见字段（全部被字段权限隐藏，3.4 场景二）"
-      :image-size="72"
-      style="grid-column: 1 / -1"
+      :image-size="40"
     />
   </div>
 </template>
@@ -93,5 +92,15 @@ function patch(key: string, v: FieldValue) {
 <style scoped>
 .group-hd .caret {
   color: var(--el-text-color-secondary);
+}
+
+/* 空状态占满整行网格，并去掉 el-empty 默认的大上下内边距，避免单头区标题下方一片空白 */
+.field-empty {
+  grid-column: 1 / -1;
+  --el-empty-padding: 8px 0;
+}
+
+.field-empty :deep(.el-empty__description) {
+  margin-top: 4px;
 }
 </style>

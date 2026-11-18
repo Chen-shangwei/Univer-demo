@@ -7,16 +7,15 @@
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { Search } from '@element-plus/icons-vue'
-import { api } from '../system/api'
-import { remote } from '../system/http'
+import { remote, type RemoteExportJob } from '../system/http'
 import { hasRole, orgById } from '../system/db'
 import { ASYNC_THRESHOLD, EXPORT_LINK_MINUTES } from '../system/flow'
 import { current } from '../system/session'
 import { ROLE } from '../system/types'
 import type { SummaryFilter } from '../system/flow'
 import type { WideRow } from '../system/row2col'
-import type { ExportJob, FieldValue, ID, RecordStatus } from '../system/types'
-import { must, fmt, run, toast } from '../utils/notify'
+import type { FieldValue, ID, RecordStatus } from '../system/types'
+import { fmt, runAsync, toast } from '../utils/notify'
 import { tagTypeOf } from '../utils/display'
 
 const me = current()
@@ -149,54 +148,85 @@ const cellOf = (row: { values: Record<string, FieldValue> }, key: string) => {
 }
 const notApplied = (row: { orgId: ID }, c: { allOrgs: boolean; appliesTo: ID[] }) => !c.allOrgs && !c.appliesTo.includes(row.orgId)
 
-/* ------------------------------------------------ 导出 */
+/* ------------------------------------------------ 导出（M3 ③：全部走后台，文件以字节流回传） */
 const canExport = computed(() => hasRole(me, ROLE.BIZ_ADMIN))
-const jobs = ref<ExportJob[]>([])
+const jobs = ref<RemoteExportJob[]>([])
 let timer = 0
 
-function refreshJobs() {
-  jobs.value = must(api.export.jobs())
+/** 将当前筛选条件拼成导出 query（orgIds 数组转逗号串） */
+function filterQuery() {
+  const f = filter.value
+  return {
+    orgIds: f.orgIds?.length ? f.orgIds.join(',') : undefined,
+    status: f.status || undefined,
+    submitFrom: f.submitFrom || undefined,
+    submitTo: f.submitTo || undefined,
+    keyword: f.keyword || undefined,
+  }
+}
+
+/** 浏览器侧拿到的 objectURL 触发下载并回收 */
+function saveBlobUrl(url: string, fileName: string) {
+  const a = document.createElement('a')
+  a.href = url
+  a.download = fileName
+  a.click()
+  setTimeout(() => URL.revokeObjectURL(url), 8000)
+}
+
+async function refreshJobs() {
+  const r = await remote.exportJobs()
+  if (r.code === 200 && r.data) jobs.value = r.data.jobs
 }
 /** 作业在后台分片生成，界面轮询状态直至完成 */
 function watchJobs() {
   timer = window.setInterval(() => {
-    refreshJobs()
-    if (!jobs.value.some((j) => j.status === 'running')) {
-      window.clearInterval(timer)
-      timer = 0
-    }
+    void refreshJobs().then(() => {
+      if (!jobs.value.some((j) => j.status === 'running')) {
+        window.clearInterval(timer)
+        timer = 0
+      }
+    })
   }, 1200)
 }
 onBeforeUnmount(() => timer && window.clearInterval(timer))
 
 function exportNow(kind: 'detail' | 'progress') {
-  run(() => {
+  void runAsync(async () => {
     if (!taskId.value) throw new Error('请先选择任务')
-    must(api.export.now(taskId.value, filter.value, kind))
+    const r = mustOk(await remote.exportNowBlob(taskId.value, kind, filterQuery()))
+    saveBlobUrl(r.url, r.fileName)
     toast('ok', kind === 'detail' ? '已按当前筛选条件导出宽表明细（小数据量同步导出）' : '已导出填报进度')
-    refreshJobs()
+    await refreshJobs()
   })
 }
 
 function exportAsync() {
-  run(() => {
-    const r = must(api.export.task(taskId.value, filter.value))
+  void runAsync(async () => {
+    const r = mustOk(await remote.exportJob(taskId.value, filter.value))
     toast('info', `导出作业 ${r.jobId} 已创建，生成中…完成后可下载（${EXPORT_LINK_MINUTES} 分钟内有效）`)
-    refreshJobs()
+    await refreshJobs()
     if (!timer) watchJobs()
   })
 }
 
-function download(token: string) {
-  run(() => {
-    must(api.export.download(token))
+function download(jobId: ID) {
+  void runAsync(async () => {
+    const r = mustOk(await remote.exportFileBlob(jobId))
+    saveBlobUrl(r.url, r.fileName)
     toast('ok', '已通过短时凭证下载，链接不暴露存储地址')
   })
 }
 
-const expireLeft = (job: ExportJob) => {
-  if (!job.download) return ''
-  const min = Math.max(0, Math.round((job.download.expireAt - Date.now()) / 60_000))
+/** 信封拆包：非 200 抛出带后台 msg 的错误，交给 runAsync 统一 toast */
+function mustOk<T>(res: { code: number; msg: string; data: T }): T {
+  if (res.code !== 200 || res.data == null) throw new Error(res.msg || '导出失败')
+  return res.data
+}
+
+const expireLeft = (job: RemoteExportJob) => {
+  if (!job.expireAt) return ''
+  const min = Math.max(0, Math.round((job.expireAt - Date.now()) / 60_000))
   return `${min} 分钟后失效`
 }
 
@@ -266,7 +296,7 @@ const stateText = () => (page.value ? `共 ${totalRows.value} 行 · ${columns.v
           <template #default="{ row }">{{ row.finishTotal || '—' }}</template>
         </el-table-column>
         <el-table-column label="完成率" width="180">
-          <template #default="{ row }"><el-progress :percentage="row.rate" :stroke-width="10" :text-inside="true" /></template>
+          <template #default="{ row }"><el-progress :percentage="row.rate" :stroke-width="16" :text-inside="true" /></template>
         </el-table-column>
         <el-table-column label="最近更新" width="160">
           <template #default="{ row }"><span class="mono muted">{{ row.lastUpdate }}</span></template>
@@ -373,9 +403,9 @@ const stateText = () => (page.value ? `共 ${totalRows.value} 行 · ${columns.v
             </el-table-column>
             <el-table-column label="操作" min-width="220">
               <template #default="{ row }">
-                <el-button v-if="row.download" type="primary" link @click="download(row.download.token)">下载 {{ row.fileName }}</el-button>
+                <el-button v-if="row.status === 'done' && row.expireAt" type="primary" link @click="download(row.jobId)">下载 {{ row.fileName }}</el-button>
                 <span v-else class="muted">{{ row.status === 'running' ? '分页读取中…' : '—' }}</span>
-                <span v-if="row.download" class="muted">{{ expireLeft(row as ExportJob) }}</span>
+                <span v-if="row.status === 'done' && row.expireAt" class="muted">{{ expireLeft(row as RemoteExportJob) }}</span>
               </template>
             </el-table-column>
           </el-table>

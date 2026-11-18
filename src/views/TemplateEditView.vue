@@ -3,24 +3,44 @@
  * 3.2 其二/其三：模板字段配置 + 表单预览。
  * 6.2 字段类型与 config 的对应关系在此维护，新增类型只扩展 config，不改外层结构。
  */
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { ArrowDown, ArrowUp, Delete, EditPen, Plus, View } from '@element-plus/icons-vue'
 import DynamicForm from '../components/DynamicForm.vue'
 import SchemaTrace from '../components/SchemaTrace.vue'
 import DetailTable from '../components/DetailTable.vue'
-import { api } from '../system/api'
-import { db } from '../system/db'
+import { remote, type RemoteTemplateBoard, type RemoteTemplateDetail } from '../system/http'
 import { detailFields, FIELD_TYPE_LABEL, headerFields } from '../system/schema-service'
-import type { FieldConfig, FieldType, FormField, ID } from '../system/types'
-import { confirmAction, must, run, runAsync, toast } from '../utils/notify'
+import type { FieldConfig, FieldType, FormField, FormSchema, ID } from '../system/types'
+import { confirmAction, must, runAsync, toast } from '../utils/notify'
 
 const route = useRoute()
-const templateId = ref<ID>((route.query.templateId as string) ?? db.form_template.find((t) => t.delFlag === 0)?.templateId ?? '')
+const board = ref<RemoteTemplateBoard | null>(null)
+const templates = computed(() => board.value?.templates ?? [])
+const templateId = ref<ID>((route.query.templateId as string) ?? '')
 
-const templates = computed(() => db.form_template.filter((t) => t.delFlag === 0))
-const detail = computed(() => (templateId.value ? must(api.template.detail(templateId.value)) : null))
-const fields = computed(() => (detail.value ? detail.value.fields : []))
+const detail = ref<RemoteTemplateDetail | null>(null)
+const fields = computed<FormField[]>(() => detail.value?.fields ?? [])
+
+async function loadDetail() {
+  if (!templateId.value) {
+    detail.value = null
+    return
+  }
+  const r = await remote.templateDetail(templateId.value)
+  detail.value = r.code === 200 ? r.data : null
+}
+
+async function load() {
+  const r = await remote.templateBoard()
+  board.value = r.code === 200 ? r.data : null
+  if (!templateId.value || !templates.value.some((t) => t.templateId === templateId.value)) {
+    templateId.value = templates.value[0]?.templateId ?? ''
+  }
+  await loadDetail()
+}
+onMounted(() => void load())
+watch(templateId, () => void loadDetail())
 
 const SCOPE_TEXT = { header: '单头区', detail: '明细区' } as const
 const TYPE_KEYS = Object.keys(FIELD_TYPE_LABEL) as FieldType[]
@@ -166,11 +186,11 @@ function toConfig(d: FieldDraft): FieldConfig {
 }
 
 function saveField() {
-  run(() => {
+  void runAsync(async () => {
     if (!templateId.value) throw new Error('请先选择模板')
     if (!draft.value.fieldKey.trim() || !draft.value.fieldLabel.trim()) throw new Error('字段标识与名称必填')
     must(
-      api.template.fieldSave(templateId.value, {
+      await remote.templateFieldSave(templateId.value, {
         fieldId: draft.value.fieldId || undefined,
         fieldKey: draft.value.fieldKey.trim(),
         fieldLabel: draft.value.fieldLabel.trim(),
@@ -180,6 +200,7 @@ function saveField() {
         fieldConfig: toConfig(draft.value),
       }),
     )
+    await loadDetail()
     toast('ok', '字段已保存')
     editing.value = false
   })
@@ -188,29 +209,28 @@ function saveField() {
 function removeField(f: FormField) {
   void runAsync(async () => {
     if (!(await confirmAction(`删除字段「${f.fieldLabel}」？历史数据仍按原版本保留（7.3）`, '删除确认'))) return
-    must(api.template.fieldRemove(f.fieldId))
+    must(await remote.templateFieldRemove(f.fieldId))
+    await loadDetail()
     toast('ok', '字段已删除，历史数据不受影响')
   })
 }
 
 function move(f: FormField, delta: number) {
-  run(() => {
-    must(api.template.fieldMove(f.fieldId, delta))
+  void runAsync(async () => {
+    must(await remote.templateFieldMove(f.fieldId, delta))
+    await loadDetail()
   })
 }
 
 /* ------------------------------------------------ 预览 */
 const previewOrg = ref<ID>('O11')
 const previewUser = ref<ID>('U4')
-const previewSchema = ref<ReturnType<typeof buildPreview> | null>(null)
-
-function buildPreview() {
-  return must(api.template.preview(templateId.value, db.form_template.find((t) => t.templateId === templateId.value)?.version ?? 'V1.0', previewOrg.value, previewUser.value))
-}
+const previewSchema = ref<FormSchema | null>(null)
 
 function doPreview() {
-  run(() => {
-    previewSchema.value = buildPreview()
+  void runAsync(async () => {
+    const version = templates.value.find((t) => t.templateId === templateId.value)?.version ?? 'V1.0'
+    previewSchema.value = must(await remote.templatePreview(templateId.value, version, previewOrg.value, previewUser.value))
   })
 }
 
@@ -285,7 +305,7 @@ const previewData = ref<Record<string, string | number | null>>({})
                 <span class="cap">模拟子单位（差异规则生效范围）</span>
                 <el-select v-model="previewOrg">
                   <el-option
-                      v-for="o in db.sys_org.filter((x) => x.orgLevel >= 2 && x.delFlag === 0)"
+                      v-for="o in board?.subOrgs ?? []"
                       :key="o.orgId"
                       :label="o.orgName"
                       :value="o.orgId"
@@ -295,7 +315,7 @@ const previewData = ref<Record<string, string | number | null>>({})
               <label class="fld">
                 <span class="cap">模拟查看人（权限裁决生效）</span>
                 <el-select v-model="previewUser" filterable>
-                  <el-option v-for="u in db.sys_user.filter((x) => x.delFlag === 0)" :key="u.userId" :label="`${u.realName}（${u.username}）`" :value="u.userId" />
+                  <el-option v-for="u in board?.users ?? []" :key="u.userId" :label="`${u.realName}（${u.username}）`" :value="u.userId" />
                 </el-select>
               </label>
             </div>

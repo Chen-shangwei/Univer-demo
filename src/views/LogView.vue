@@ -3,16 +3,17 @@
  * 3.10 操作日志检索。
  * 日志只追加不修改，界面不提供任何删除入口（3.10 其二）；
  * 八类关键动作 + 附件与撤回共 11 个操作类型可按需组合检索，失败动作（result=0）标红呈现。
+ * 数据全部来自后台：字典与埋点走 logBoard，明细分页走 logPage（服务端已 join 操作人/单位）。
  */
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { Search } from '@element-plus/icons-vue'
-import { api } from '../system/api'
-import { db, orgById, userName } from '../system/db'
-import { OPER_TYPE } from '../system/types'
-import type { ID } from '../system/types'
-import { must, run, toast } from '../utils/notify'
+import { remote, type RemoteLogBoard, type RemoteLogPage } from '../system/http'
+import { runAsync, toast } from '../utils/notify'
 
-const OPER_TYPES = Object.values(OPER_TYPE) as string[]
+const board = ref<RemoteLogBoard | null>(null)
+const OPER_TYPES = computed(() => board.value?.operTypes ?? [])
+const users = computed(() => board.value?.users ?? [])
+const POINTS = computed(() => board.value?.points ?? [])
 
 const operType = ref('')
 const userId = ref('')
@@ -27,26 +28,35 @@ const pageSize = ref(20)
 const timeFrom = computed(() => (from.value ? `${from.value} 00:00:00` : undefined))
 const timeTo = computed(() => (to.value ? `${to.value} 23:59:59` : undefined))
 
-const page = computed(() =>
-  must(
-    api.log.page({
-      pageNum: pageNum.value,
-      pageSize: pageSize.value,
-      operType: operType.value || undefined,
-      userId: (userId.value || undefined) as ID | undefined,
-      bizId: (bizId.value.trim() || undefined) as ID | undefined,
-      from: timeFrom.value,
-      to: timeTo.value,
-      keyword: keyword.value.trim() || undefined,
-    }),
-  ),
-)
+const page = ref<RemoteLogPage>({ total: 0, pages: 1, list: [] })
+
+async function loadPage() {
+  const r = await remote.logPage({
+    pageNum: pageNum.value,
+    pageSize: pageSize.value,
+    operType: operType.value || undefined,
+    userId: userId.value || undefined,
+    bizId: bizId.value.trim() || undefined,
+    from: timeFrom.value,
+    to: timeTo.value,
+    keyword: keyword.value.trim() || undefined,
+  })
+  if (r.code === 200 && r.data) page.value = r.data
+}
+
+async function loadBoard() {
+  const r = await remote.logBoard()
+  board.value = r.code === 200 ? r.data : null
+}
+
+onMounted(() => void Promise.all([loadBoard(), loadPage()]))
+watch([pageNum, pageSize], () => void loadPage())
 
 function search() {
   pageNum.value = 1
-  run(() => {
-    const total = page.value.total
-    toast('info', `检索到 ${total} 条日志`)
+  void runAsync(async () => {
+    await loadPage()
+    toast('info', `检索到 ${page.value.total} 条日志`)
   })
 }
 
@@ -58,6 +68,7 @@ function reset() {
   to.value = ''
   keyword.value = ''
   pageNum.value = 1
+  void loadPage()
 }
 
 /** 按任务 / 记录 / 模板定位日志：把列表中的业务标识回填为检索条件 */
@@ -66,14 +77,7 @@ function locate(biz: string) {
   search()
 }
 
-const users = computed(() => db.sys_user.filter((u) => u.delFlag === 0))
-const orgName = (id: ID) => orgById(id)?.orgName ?? id
 const BIZ_LABEL: Record<string, string> = { task: '任务', record: '填报记录', template: '模板', org: '组织', user: '用户' }
-
-/** 3.10 其一：埋点清单，逐项对照本系统是否已落库 */
-const POINTS = computed(() =>
-  OPER_TYPES.map((t) => ({ type: t, count: db.form_oper_log.filter((l) => l.operType === t).length })),
-)
 
 /** 失败动作整行标红（result=0） */
 function rowClass({ row }: { row: { result: number } }) {
@@ -123,10 +127,10 @@ function rowClass({ row }: { row: { result: number } }) {
           <template #default="{ row }"><el-tag size="small" type="info" effect="plain">{{ row.operType }}</el-tag></template>
         </el-table-column>
         <el-table-column label="操作人" width="100">
-          <template #default="{ row }">{{ userName(row.userId as ID) }}</template>
+          <template #default="{ row }">{{ row.userName }}</template>
         </el-table-column>
         <el-table-column label="单位" width="140" show-overflow-tooltip>
-          <template #default="{ row }"><span class="muted">{{ orgName(row.orgId as ID) }}</span></template>
+          <template #default="{ row }"><span class="muted">{{ row.orgName }}</span></template>
         </el-table-column>
         <el-table-column label="日志内容" min-width="300" prop="content" show-overflow-tooltip />
         <el-table-column label="业务标识" min-width="180">

@@ -3,30 +3,63 @@
  * 3.3 子单位差异化配置：隐藏字段、修改字段属性、新增本单位独有字段，支持批量复制。
  * 合并语义见 7.1：同 fieldKey 多条规则以最后保存为准，新增字段冲突直接拒绝。
  */
-import { computed, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { CopyDocument, Delete, EditPen, Plus } from '@element-plus/icons-vue'
-import { api } from '../system/api'
-import { db } from '../system/db'
-import { FIELD_TYPE_LABEL, mergeFields, TARGET_LABEL } from '../system/schema-service'
-import type { DiffType, FieldType, FormField, FormOrgDiff, ID } from '../system/types'
-import { must, run, toast } from '../utils/notify'
+import { remote, type RemoteDiffInput, type RemoteTemplateBoard } from '../system/http'
+import { FIELD_TYPE_LABEL, TARGET_LABEL } from '../system/schema-service'
+import type { DiffType, FieldConfig, FieldType, FormField, FormOrgDiff, ID } from '../system/types'
+import { must, runAsync, toast } from '../utils/notify'
 
 const route = useRoute()
-const templateId = ref<ID>((route.query.templateId as string) ?? db.form_template.find((t) => t.delFlag === 0)?.templateId ?? '')
+const board = ref<RemoteTemplateBoard | null>(null)
+const templateId = ref<ID>((route.query.templateId as string) ?? '')
 const orgId = ref<ID>('')
 
-const templates = computed(() => db.form_template.filter((t) => t.delFlag === 0))
-const subOrgs = computed(() => db.sys_org.filter((o) => o.orgLevel >= 2 && o.delFlag === 0))
-if (!subOrgs.value.some((o) => o.orgId === orgId.value)) orgId.value = subOrgs.value[0]?.orgId ?? ''
+const templates = computed(() => board.value?.templates ?? [])
+const subOrgs = computed(() => board.value?.subOrgs ?? [])
+const orgName = (id: ID) => board.value?.orgs.find((o) => o.orgId === id)?.orgName ?? id
 
-const template = computed(() => db.form_template.find((t) => t.templateId === templateId.value))
-/** 当前模板版本的基础字段（差异规则的可选范围） */
-const baseFields = computed<FormField[]>(() =>
-  template.value ? db.form_field.filter((f) => f.templateId === templateId.value && f.version === template.value!.version && f.delFlag === 0) : [],
-)
+/** 当前模板版本的基础字段（后端 diff/merged 回带） */
+const baseFields = ref<FormField[]>([])
+const mergedFields = ref<FormField[]>([])
+const rules = ref<FormOrgDiff[]>([])
 
-const rules = computed(() => must(api.diff.list(templateId.value, orgId.value)))
+async function loadMerged() {
+  if (!templateId.value || !orgId.value) {
+    baseFields.value = []
+    mergedFields.value = []
+    return
+  }
+  const r = await remote.diffMerged(templateId.value, orgId.value)
+  if (r.code === 200 && r.data) {
+    baseFields.value = r.data.base
+    mergedFields.value = r.data.merged
+  }
+}
+async function loadRules() {
+  if (!templateId.value || !orgId.value) {
+    rules.value = []
+    return
+  }
+  const r = await remote.diffList(templateId.value, orgId.value)
+  rules.value = r.code === 200 ? r.data : []
+}
+
+async function load() {
+  const r = await remote.templateBoard()
+  board.value = r.code === 200 ? r.data : null
+  if (!templateId.value || !templates.value.some((t) => t.templateId === templateId.value)) {
+    templateId.value = templates.value[0]?.templateId ?? ''
+  }
+  if (!subOrgs.value.some((o) => o.orgId === orgId.value)) orgId.value = subOrgs.value[0]?.orgId ?? ''
+  await Promise.all([loadMerged(), loadRules()])
+}
+onMounted(() => void load())
+watch([templateId, orgId], () => {
+  void loadMerged()
+  void loadRules()
+})
 
 const DIFF_TEXT: Record<DiffType, string> = { 1: '隐藏字段', 2: '修改属性', 3: '新增独有字段' }
 const DIFF_TAG: Record<DiffType, 'danger' | 'warning' | 'success'> = { 1: 'danger', 2: 'warning', 3: 'success' }
@@ -87,8 +120,8 @@ function editRule(d: FormOrgDiff) {
   editing.value = true
 }
 
-function buildConfig() {
-  const c: Record<string, unknown> = {}
+function buildConfig(): FieldConfig | undefined {
+  const c: FieldConfig = {}
   if (draft.maxLength) c.maxLength = draft.maxLength
   if (draft.optionsText.trim()) {
     c.options = draft.optionsText
@@ -109,10 +142,10 @@ function buildConfig() {
 }
 
 function save() {
-  run(() => {
+  void runAsync(async () => {
     if (!orgId.value) throw new Error('请先选择子单位')
     if (!draft.fieldKey.trim()) throw new Error('请选择或填写字段标识')
-    const payload: Parameters<typeof api.diff.save>[0] = {
+    const payload: RemoteDiffInput = {
       diffId: draft.diffId || undefined,
       templateId: templateId.value,
       orgId: orgId.value,
@@ -135,16 +168,18 @@ function save() {
       payload.scope = draft.scope
       payload.fieldConfig = { ...(buildConfig() ?? {}), scope: draft.scope }
     }
-    must(api.diff.save(payload))
+    must(await remote.diffSave(payload))
     toast('ok', '差异规则已保存')
     editing.value = false
+    await Promise.all([loadMerged(), loadRules()])
   })
 }
 
 function remove(d: FormOrgDiff) {
-  run(() => {
-    must(api.diff.remove(d.diffId))
+  void runAsync(async () => {
+    must(await remote.diffRemove(d.diffId))
     toast('ok', '规则已删除')
+    await Promise.all([loadMerged(), loadRules()])
   })
 }
 
@@ -152,26 +187,24 @@ function remove(d: FormOrgDiff) {
 const copyTargets = ref<ID[]>([])
 
 function doCopy() {
-  run(() => {
+  void runAsync(async () => {
     if (!copyTargets.value.length) throw new Error('请选择目标单位')
-    const n = must(api.diff.copy(orgId.value, copyTargets.value, templateId.value))
+    const n = must(await remote.diffCopy(orgId.value, copyTargets.value, templateId.value))
     toast('ok', `已复制 ${n} 条规则到 ${copyTargets.value.length} 个单位，可在各单位下单独调整`)
     copyTargets.value = []
+    await Promise.all([loadMerged(), loadRules()])
   })
 }
 
 /* ------------------------------------------------ 合并结果（7.1 自证） */
-const merged = computed(() =>
-  template.value ? mergeFields(templateId.value, template.value.version, orgId.value, []) : [],
-)
 const hiddenKeys = computed(() => {
-  const m = new Set(merged.value.map((f) => f.fieldKey))
+  const m = new Set(mergedFields.value.map((f) => f.fieldKey))
   return baseFields.value.filter((f) => !m.has(f.fieldKey)).map((f) => f.fieldKey)
 })
 
 /** 合并结果与被打掉的隐藏字段并表呈现，隐藏行置灰（6.3） */
 const mergedRows = computed(() => [
-  ...merged.value.map((f) => ({
+  ...mergedFields.value.map((f) => ({
     rowKey: f.fieldId,
     hidden: false,
     sort: f.sort as number | string,
@@ -223,7 +256,7 @@ function mergedClass({ row }: { row: { hidden: boolean } }) {
     <div class="split">
       <div class="main">
         <div class="card">
-          <h3>{{ db.sys_org.find((o) => o.orgId === orgId)?.orgName }} 的差异规则（{{ rules.length }} 条）</h3>
+          <h3>{{ orgName(orgId) }} 的差异规则（{{ rules.length }} 条）</h3>
           <el-table :data="rules" size="small" border row-key="diffId" empty-text="该单位暂无差异化规则，完全沿用主模板">
             <el-table-column label="类型" width="130">
               <template #default="{ row }">
@@ -336,7 +369,7 @@ function mergedClass({ row }: { row: { hidden: boolean } }) {
       <div class="side">
         <div class="card">
           <h3>批量复制</h3>
-          <p class="muted">把 {{ db.sys_org.find((o) => o.orgId === orgId)?.orgName }} 的 {{ rules.length }} 条规则复制给其他单位（同 fieldKey 覆盖，无则新增）。</p>
+          <p class="muted">把 {{ orgName(orgId) }} 的 {{ rules.length }} 条规则复制给其他单位（同 fieldKey 覆盖，无则新增）。</p>
           <el-checkbox-group v-model="copyTargets" class="check-col">
             <el-checkbox v-for="o in subOrgs.filter((x) => x.orgId !== orgId)" :key="o.orgId" :value="o.orgId">{{ o.orgName }}</el-checkbox>
           </el-checkbox-group>

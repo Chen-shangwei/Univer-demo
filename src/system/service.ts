@@ -74,6 +74,27 @@ export function saveOrg(input: { orgId?: ID; orgName: string; orgCode: string; p
   logOp({ userId: user.userId, orgId: user.orgId, operType: '模板变更', bizId: input.orgId ?? '', bizType: 'org', content: `保存单位 ${input.orgName}(${input.orgCode})` })
 }
 
+/**
+ * 3.1 删除单位（软删除，delFlag=1）。
+ * 约束：仍有下级单位、或该单位已产生填报记录（7.3 历史需保留）时拒绝；
+ * 通过后级联停用该单位下的部门与账号，避免留下悬空数据。
+ */
+export function removeOrg(orgId: ID, user = mustCurrent()): void {
+  if (!hasRole(user, 'sys_admin')) throw new ApiError(ERR.FORBIDDEN, '仅系统管理员可维护组织')
+  const o = db.sys_org.find((x) => x.orgId === orgId && x.delFlag === 0)
+  if (!o) throw new ApiError(ERR.NOT_FOUND, '单位不存在')
+  if (db.sys_org.some((c) => c.parentId === orgId && c.delFlag === 0)) {
+    throw new ApiError(ERR.FORBIDDEN, '该单位下还有下级单位，请先删除下级')
+  }
+  if (db.form_record.some((r) => r.orgId === orgId && r.delFlag === 0)) {
+    throw new ApiError(ERR.FORBIDDEN, '该单位已产生填报记录，历史数据需保留，不能删除（7.3）')
+  }
+  db.sys_dept.filter((d) => d.orgId === orgId && d.delFlag === 0).forEach((d) => (d.delFlag = 1))
+  db.sys_user.filter((u) => u.orgId === orgId && u.delFlag === 0).forEach((u) => (u.delFlag = 1))
+  o.delFlag = 1
+  logOp({ userId: user.userId, orgId: user.orgId, operType: '模板变更', bizId: orgId, bizType: 'org', content: `删除单位 ${o.orgName}(${o.orgCode})，已级联停用其部门与账号` })
+}
+
 export function saveDept(input: { deptId?: ID; deptName: string; orgId: ID; sort: number; status: 0 | 1 }, user = mustCurrent()): void {
   if (!hasRole(user, 'sys_admin')) throw new ApiError(ERR.FORBIDDEN, '仅系统管理员可维护部门')
   if (input.deptId) {

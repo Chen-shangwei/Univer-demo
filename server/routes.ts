@@ -3,9 +3,9 @@
  * 业务判定一律复用 src/system 逻辑层，路由只做「HTTP ↔ 逻辑」的翻译与统一信封。
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
-import { ApiError, ERR, db, rolesOf, workbench, loadFill, saveDraft, submitReport, resetDemo, recordDetail, auditOperate, revokeAudit, summaryView, orgTree, taskViewsFor, scopeOrgs, heartbeat, lockHolder, attachmentsOf, validateForm, addAttachment, removeAttachment } from './context'
-import type { FieldValue, SysUser, SummaryFilter, FormAttachment } from './context'
-import { auditList, myTaskViews, summaryBoard } from './read-model'
+import { ApiError, ERR, db, rolesOf, workbench, loadFill, saveDraft, submitReport, resetDemo, recordDetail, auditOperate, revokeAudit, summaryView, orgTree, taskViewsFor, scopeOrgs, heartbeat, lockHolder, attachmentsOf, validateForm, addAttachment, removeAttachment, saveOrg, removeOrg, saveDept, saveUser, createTask, archiveTask, tickTasks, nextId, logOp, taskById, saveTemplate, changeTemplateStatus, saveField, removeField, moveField, publishVersion, saveDiff, removeDiff, copyDiff, savePerm, removePerm, previewSchema, createExportJob } from './context'
+import type { FieldValue, SysUser, SummaryFilter, FormAttachment, ID, FormSchema } from './context'
+import { auditList, myTaskViews, summaryBoard, orgBoard, userPage, taskBoard, templateBoard, templateDetail, permFieldKeys, permDecision, diffMerged, logBoard, logPage, exportBoard, buildExportCsv } from './read-model'
 import { issueToken, verifyToken } from './token'
 import { httpStatus, ok, toFail } from './envelope'
 
@@ -303,6 +303,487 @@ export function registerRoutes(app: FastifyInstance): void {
       const pageNum = Number(q.pageNum ?? 1)
       const pageSize = Number(q.pageSize ?? 20)
       return ok(summaryBoard(user, q.taskId, filter, pageNum, pageSize))
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 3.1 组织管理：GET /api/org/board —— 单位树 + 扁平单位/部门/用户/角色一次取全 */
+  app.get('/api/org/board', async (req, reply) => {
+    try {
+      authenticate(req)
+      return ok(orgBoard())
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 接口 3：GET /api/user/page —— 用户分页检索 */
+  app.get('/api/user/page', async (req, reply) => {
+    try {
+      authenticate(req)
+      const q = req.query as Record<string, string | undefined>
+      return ok(userPage({ pageNum: q.pageNum ? Number(q.pageNum) : undefined, pageSize: q.pageSize ? Number(q.pageSize) : undefined, orgId: q.orgId, keyword: q.keyword }))
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 3.1：POST /api/org/save —— 新增/编辑单位（仅系统管理员，saveOrg 内建校验） */
+  app.post('/api/org/save', async (req, reply) => {
+    try {
+      const user = authenticate(req)
+      const b = (req.body ?? {}) as { orgId?: ID; orgName: string; orgCode: string; parentId: ID; orgLevel: 1 | 2 | 3; sort: number; status: 0 | 1 }
+      if (!b.orgName || !b.orgCode) throw new ApiError(ERR.REQUIRED, '单位名称与编码必填')
+      saveOrg(b, user)
+      return ok(true)
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 3.1：POST /api/org/remove —— 删除单位（软删除，下级/填报数据约束由 removeOrg 内建校验） */
+  app.post('/api/org/remove', async (req, reply) => {
+    try {
+      const user = authenticate(req)
+      const b = (req.body ?? {}) as { orgId?: ID }
+      if (!b.orgId) throw new ApiError(ERR.REQUIRED, 'orgId 必填')
+      removeOrg(b.orgId, user)
+      return ok(true)
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 3.1：POST /api/org/dept-save —— 新增/编辑部门 */
+  app.post('/api/org/dept-save', async (req, reply) => {
+    try {
+      const user = authenticate(req)
+      const b = (req.body ?? {}) as { deptId?: ID; deptName: string; orgId: ID; sort: number; status: 0 | 1 }
+      if (!b.deptName || !b.orgId) throw new ApiError(ERR.REQUIRED, '部门名称与所属单位必填')
+      saveDept(b, user)
+      return ok(true)
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 3.1：POST /api/user/save —— 新增/编辑用户（一人多角色，初始密码 123456） */
+  app.post('/api/user/save', async (req, reply) => {
+    try {
+      const user = authenticate(req)
+      const b = (req.body ?? {}) as { userId?: ID; username: string; realName: string; orgId: ID; deptId: ID; mobile: string; status: 0 | 1; roleIds: ID[] }
+      if (!b.username || !b.realName) throw new ApiError(ERR.REQUIRED, '登录账号与姓名必填')
+      saveUser(b, user)
+      return ok(true)
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 3.5 任务管理：GET /api/task/board —— 台账行（含范围/统计）+ 模板/单位/角色/用户字典 + 临期催办 */
+  app.get('/api/task/board', async (req, reply) => {
+    try {
+      authenticate(req)
+      return ok(taskBoard())
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 接口 13：POST /api/task/create —— 新建/编辑任务并下发（返回 taskId） */
+  app.post('/api/task/create', async (req, reply) => {
+    try {
+      const user = authenticate(req)
+      const b = (req.body ?? {}) as Parameters<typeof createTask>[0]
+      if (!b.taskName || !b.templateId) throw new ApiError(ERR.REQUIRED, '任务名称与模板必填')
+      return ok(createTask(b, user))
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 接口 15：POST /api/task/publish —— 发布即按 9.2 推进状态，返回 { status, changed, reminds } */
+  app.post('/api/task/publish', async (req, reply) => {
+    try {
+      const user = authenticate(req)
+      const b = (req.body ?? {}) as { taskId?: ID }
+      if (!b.taskId) throw new ApiError(ERR.REQUIRED, 'taskId 必填')
+      const t = taskById(b.taskId)
+      if (!t) throw new ApiError(ERR.NOT_FOUND, '任务不存在')
+      const changed = tickTasks()
+      logOp({ userId: user.userId, orgId: user.orgId, operType: '任务下发', bizId: b.taskId, bizType: 'task', content: `发布任务「${t.taskName}」，当前状态 ${['待开始', '进行中', '已截止', '已归档'][t.status]}` })
+      return ok({ status: t.status, changed: changed.changed, reminds: changed.reminds })
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 接口 14：POST /api/task/archive —— 归档任务（数据转只读留存） */
+  app.post('/api/task/archive', async (req, reply) => {
+    try {
+      const user = authenticate(req)
+      const b = (req.body ?? {}) as { taskId?: ID }
+      if (!b.taskId) throw new ApiError(ERR.REQUIRED, 'taskId 必填')
+      archiveTask(b.taskId, user)
+      return ok(true)
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 9.2 定时任务口径：POST /api/task/tick —— 手动触发一次状态推进与临期催办 */
+  app.post('/api/task/tick', async (req, reply) => {
+    try {
+      authenticate(req)
+      return ok(tickTasks())
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 接口 15 辅助：POST /api/task/scope-save —— 调整下发范围（保留已产生记录） */
+  app.post('/api/task/scope-save', async (req, reply) => {
+    try {
+      const user = authenticate(req)
+      const b = (req.body ?? {}) as { taskId?: ID; orgIds?: ID[] }
+      if (!b.taskId) throw new ApiError(ERR.REQUIRED, 'taskId 必填')
+      const orgIds = b.orgIds ?? []
+      if (!orgIds.length) throw new ApiError(ERR.OUT_OF_SCOPE, '下发范围不能为空')
+      db.form_task_scope = db.form_task_scope.filter((s) => s.taskId !== b.taskId)
+      orgIds.forEach((orgId) => db.form_task_scope.push({ delFlag: 0, scopeId: nextId('S'), taskId: b.taskId!, orgId }))
+      logOp({ userId: user.userId, orgId: user.orgId, operType: '任务下发', bizId: b.taskId, bizType: 'task', content: `调整任务下发范围为 ${orgIds.length} 个单位` })
+      return ok(orgIds)
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 3.2 模板管理：GET /api/template/board —— 台账行(含字段数/任务数) + 业务分类 + 字典 + 最近变更 */
+  app.get('/api/template/board', async (req, reply) => {
+    try {
+      authenticate(req)
+      return ok(templateBoard())
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 接口 6：GET /api/template/detail —— 模板详情（当前版本字段 + 历史版本快照） */
+  app.get('/api/template/detail', async (req, reply) => {
+    try {
+      authenticate(req)
+      const q = req.query as Record<string, string | undefined>
+      if (!q.templateId) throw new ApiError(ERR.REQUIRED, 'templateId 必填')
+      return ok(templateDetail(q.templateId, q.version))
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 接口 4：POST /api/template/save —— 新建/编辑模板（返回 templateId） */
+  app.post('/api/template/save', async (req, reply) => {
+    try {
+      const user = authenticate(req)
+      const b = (req.body ?? {}) as Parameters<typeof saveTemplate>[0]
+      if (!b.templateName) throw new ApiError(ERR.REQUIRED, '模板名称必填')
+      return ok(saveTemplate(b, user))
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 接口 4 辅助：POST /api/template/status —— 启用/停用/归档 */
+  app.post('/api/template/status', async (req, reply) => {
+    try {
+      const user = authenticate(req)
+      const b = (req.body ?? {}) as { templateId?: ID; status?: 0 | 1 | 2 | 3 }
+      if (!b.templateId) throw new ApiError(ERR.REQUIRED, 'templateId 必填')
+      if (b.status === undefined) throw new ApiError(ERR.REQUIRED, 'status 必填')
+      changeTemplateStatus(b.templateId, b.status, user)
+      return ok(true)
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 接口 7：POST /api/template/publish-version —— 发布新版本（返回新版本号） */
+  app.post('/api/template/publish-version', async (req, reply) => {
+    try {
+      const user = authenticate(req)
+      const b = (req.body ?? {}) as { templateId?: ID; summary?: string }
+      if (!b.templateId) throw new ApiError(ERR.REQUIRED, 'templateId 必填')
+      return ok(publishVersion(b.templateId, b.summary ?? '', user))
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 接口 5：POST /api/template/field/save —— 新增/编辑字段 */
+  app.post('/api/template/field/save', async (req, reply) => {
+    try {
+      const user = authenticate(req)
+      const b = (req.body ?? {}) as { templateId?: ID; field?: Parameters<typeof saveField>[1] }
+      if (!b.templateId || !b.field) throw new ApiError(ERR.REQUIRED, 'templateId 与 field 必填')
+      saveField(b.templateId, b.field, user)
+      return ok(true)
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 接口 5 辅助：POST /api/template/field/remove —— 删除字段（历史数据仍按原版本保留） */
+  app.post('/api/template/field/remove', async (req, reply) => {
+    try {
+      const user = authenticate(req)
+      const b = (req.body ?? {}) as { fieldId?: ID }
+      if (!b.fieldId) throw new ApiError(ERR.REQUIRED, 'fieldId 必填')
+      removeField(b.fieldId, user)
+      return ok(true)
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 接口 5 辅助：POST /api/template/field/move —— 字段上/下移 */
+  app.post('/api/template/field/move', async (req, reply) => {
+    try {
+      authenticate(req)
+      const b = (req.body ?? {}) as { fieldId?: ID; delta?: number }
+      if (!b.fieldId) throw new ApiError(ERR.REQUIRED, 'fieldId 必填')
+      moveField(b.fieldId, Number(b.delta ?? 0))
+      return ok(true)
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 3.2 预览：GET /api/template/preview —— 任选子单位/查看人预览表单 Schema */
+  app.get('/api/template/preview', async (req, reply) => {
+    try {
+      authenticate(req)
+      const q = req.query as Record<string, string | undefined>
+      if (!q.templateId || !q.version || !q.orgId || !q.userId) throw new ApiError(ERR.REQUIRED, 'templateId / version / orgId / userId 必填')
+      const u = db.sys_user.find((x) => x.userId === q.userId)
+      if (!u) throw new ApiError(ERR.NOT_FOUND, '预览用户不存在')
+      return ok<FormSchema>(previewSchema(u, q.templateId, q.version, q.orgId))
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 3.4 字段权限：GET /api/perm/list —— 模板维度规则清单 */
+  app.get('/api/perm/list', async (req, reply) => {
+    try {
+      authenticate(req)
+      const q = req.query as Record<string, string | undefined>
+      if (!q.templateId) throw new ApiError(ERR.REQUIRED, 'templateId 必填')
+      return ok(db.form_field_permission.filter((p) => p.templateId === q.templateId && p.delFlag === 0 && (!q.fieldKey || p.fieldKey === q.fieldKey)))
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 接口 11：POST /api/perm/save —— 新增/编辑权限规则 */
+  app.post('/api/perm/save', async (req, reply) => {
+    try {
+      const user = authenticate(req)
+      const b = (req.body ?? {}) as Parameters<typeof savePerm>[0]
+      if (!b.templateId || !b.fieldKey || !b.targetId) throw new ApiError(ERR.REQUIRED, '模板/字段/权限对象必填')
+      savePerm(b, user)
+      return ok(true)
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 接口 12：POST /api/perm/remove —— 删除权限规则 */
+  app.post('/api/perm/remove', async (req, reply) => {
+    try {
+      const user = authenticate(req)
+      const b = (req.body ?? {}) as { permId?: ID }
+      if (!b.permId) throw new ApiError(ERR.REQUIRED, 'permId 必填')
+      removePerm(b.permId, user)
+      return ok(true)
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 3.4 辅助：GET /api/perm/field-keys —— 可选字段标识（基础 + 独有） */
+  app.get('/api/perm/field-keys', async (req, reply) => {
+    try {
+      authenticate(req)
+      const q = req.query as Record<string, string | undefined>
+      if (!q.templateId) throw new ApiError(ERR.REQUIRED, 'templateId 必填')
+      return ok(permFieldKeys(q.templateId))
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 3.4 裁决预览：GET /api/perm/decision —— 服务端产出 Schema + 逐字段裁决行 */
+  app.get('/api/perm/decision', async (req, reply) => {
+    try {
+      authenticate(req)
+      const q = req.query as Record<string, string | undefined>
+      if (!q.templateId || !q.orgId || !q.userId) throw new ApiError(ERR.REQUIRED, 'templateId / orgId / userId 必填')
+      return ok(permDecision(q.templateId, q.orgId, q.userId))
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 3.3 差异规则：GET /api/diff/list —— 模板(+单位)维度清单 */
+  app.get('/api/diff/list', async (req, reply) => {
+    try {
+      authenticate(req)
+      const q = req.query as Record<string, string | undefined>
+      if (!q.templateId) throw new ApiError(ERR.REQUIRED, 'templateId 必填')
+      return ok(db.form_org_diff.filter((d) => d.templateId === q.templateId && d.delFlag === 0 && (!q.orgId || d.orgId === q.orgId)))
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 接口 8：POST /api/diff/save —— 新增/编辑差异规则 */
+  app.post('/api/diff/save', async (req, reply) => {
+    try {
+      const user = authenticate(req)
+      const b = (req.body ?? {}) as Parameters<typeof saveDiff>[0]
+      if (!b.templateId || !b.orgId || !b.fieldKey) throw new ApiError(ERR.REQUIRED, '模板/单位/字段标识必填')
+      saveDiff(b, user)
+      return ok(true)
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 接口 9：POST /api/diff/remove —— 删除差异规则 */
+  app.post('/api/diff/remove', async (req, reply) => {
+    try {
+      const user = authenticate(req)
+      const b = (req.body ?? {}) as { diffId?: ID }
+      if (!b.diffId) throw new ApiError(ERR.REQUIRED, 'diffId 必填')
+      removeDiff(b.diffId, user)
+      return ok(true)
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 接口 10：POST /api/diff/copy —— 批量复制差异规则，返回复制条数 */
+  app.post('/api/diff/copy', async (req, reply) => {
+    try {
+      const user = authenticate(req)
+      const b = (req.body ?? {}) as { fromOrgId?: ID; toOrgIds?: ID[]; templateId?: ID }
+      if (!b.fromOrgId || !b.templateId || !b.toOrgIds?.length) throw new ApiError(ERR.REQUIRED, '来源/目标单位与模板必填')
+      return ok(copyDiff(b.fromOrgId, b.toOrgIds, b.templateId, user))
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 3.3 合并自证：GET /api/diff/merged —— base 基础字段 + 应用差异后的 merged */
+  app.get('/api/diff/merged', async (req, reply) => {
+    try {
+      authenticate(req)
+      const q = req.query as Record<string, string | undefined>
+      if (!q.templateId || !q.orgId) throw new ApiError(ERR.REQUIRED, 'templateId 与 orgId 必填')
+      return ok(diffMerged(q.templateId, q.orgId))
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 3.10 操作日志：GET /api/log/board —— 检索字典（操作人/类型）+ 埋点覆盖统计 */
+  app.get('/api/log/board', async (req, reply) => {
+    try {
+      authenticate(req)
+      return ok(logBoard())
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 接口 29：GET /api/log/page —— 日志只追加不修改，服务端按条件分页并 join 操作人/单位 */
+  app.get('/api/log/page', async (req, reply) => {
+    try {
+      authenticate(req)
+      const q = req.query as Record<string, string | undefined>
+      return ok(
+        logPage({
+          pageNum: Number(q.pageNum ?? 1),
+          pageSize: Number(q.pageSize ?? 20),
+          operType: q.operType || undefined,
+          userId: q.userId || undefined,
+          bizId: q.bizId || undefined,
+          from: q.from || undefined,
+          to: q.to || undefined,
+          keyword: q.keyword || undefined,
+        }),
+      )
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 3.8 其五：POST /api/export/job —— 发起异步导出作业（后台分片生成），返回 jobId */
+  app.post('/api/export/job', async (req, reply) => {
+    try {
+      const user = authenticate(req)
+      const b = (req.body ?? {}) as { taskId?: ID; filter?: SummaryFilter }
+      if (!b.taskId) throw new ApiError(ERR.REQUIRED, 'taskId 必填')
+      return ok({ jobId: createExportJob(user, b.taskId, b.filter ?? {}) })
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 3.8 其五：GET /api/export/jobs —— 作业清单（去内联正文，供轮询状态与下载入口） */
+  app.get('/api/export/jobs', async (req, reply) => {
+    try {
+      const user = authenticate(req)
+      return ok(exportBoard(user))
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 3.8 立即导出：GET /api/export/now —— 同步产出 CSV，以文件流回传（不暴露存储地址） */
+  app.get('/api/export/now', async (req, reply) => {
+    try {
+      const user = authenticate(req)
+      const q = req.query as Record<string, string | undefined>
+      if (!q.taskId) throw new ApiError(ERR.REQUIRED, 'taskId 必填')
+      const kind = q.kind === 'progress' ? 'progress' : 'detail'
+      const filter: SummaryFilter = {}
+      if (q.orgIds) filter.orgIds = q.orgIds.split(',').filter(Boolean)
+      if (q.status) filter.status = q.status as SummaryFilter['status']
+      if (q.submitFrom) filter.submitFrom = q.submitFrom
+      if (q.submitTo) filter.submitTo = q.submitTo
+      if (q.keyword) filter.keyword = q.keyword
+      const { fileName, content } = buildExportCsv(user, q.taskId, filter, kind)
+      logOp({ userId: user.userId, orgId: user.orgId, operType: '数据导出', bizId: q.taskId, bizType: 'task', content: kind === 'progress' ? '导出填报进度 CSV' : '导出宽表明细 CSV' })
+      reply.header('Content-Disposition', `attachment; filename="${encodeURIComponent(fileName)}"`)
+      return reply.type('text/csv;charset=utf-8').send(Buffer.from(content, 'utf8'))
+    } catch (e) {
+      return handleError(reply, e)
+    }
+  })
+
+  /** 3.8 作业下载：GET /api/export/file —— 按 jobId 流式回传后台已生成的正文 */
+  app.get('/api/export/file', async (req, reply) => {
+    try {
+      authenticate(req)
+      const q = req.query as Record<string, string | undefined>
+      if (!q.jobId) throw new ApiError(ERR.REQUIRED, 'jobId 必填')
+      const job = db.export_job.find((j) => j.jobId === q.jobId)
+      if (!job || !job.content) throw new ApiError(ERR.NOT_FOUND, '导出作业不存在或正文未生成')
+      if (job.status !== 'done') throw new ApiError(ERR.LINK_EXPIRED, '导出作业尚未完成')
+      if (job.download && Date.now() > job.download.expireAt) throw new ApiError(ERR.LINK_EXPIRED, '下载链接已过期，请重新发起导出')
+      reply.header('Content-Disposition', `attachment; filename="${encodeURIComponent(job.fileName ?? `${job.jobId}.csv`)}"`)
+      return reply.type('text/csv;charset=utf-8').send(Buffer.from(job.content, 'utf8'))
     } catch (e) {
       return handleError(reply, e)
     }

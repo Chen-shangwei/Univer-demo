@@ -150,12 +150,20 @@ async function toggleOther(checked: boolean) {
   onBlur()
 }
 
-/* 日期：5.1 统一 yyyy-MM-dd / yyyy-MM-dd HH:mm，与 el-date-picker 的 value-format 同口径 */
+/* 日期：库存值统一 yyyy-MM-dd / yyyy-MM-dd HH:mm（value-format 固定 ISO 口径），展示格式跟随模板 config.format */
 const DATE_RE = /^\d{4}-\d{2}-\d{2}/
 const dateValue = computed(() => (DATE_RE.test(raw.value) ? raw.value.slice(0, 10) : ''))
 const dateTimeValue = computed(() =>
   DATE_RE.test(raw.value) ? `${raw.value.slice(0, 10)} ${raw.value.slice(11, 16)}` : '',
 )
+
+/** 模板配置的是后端/MySQL 口径（yyyy-MM-dd HH:mm），el-date-picker 用 day.js token，需转换大小写 */
+function toPickerFormat(f: string | undefined, time: boolean): string {
+  if (!f) return time ? 'YYYY-MM-DD HH:mm' : 'YYYY-MM-DD'
+  return f.replace(/yyyy/g, 'YYYY').replace(/yy/g, 'YY').replace(/dd/g, 'DD').replace(/\bd\b/g, 'D')
+}
+const dateFormat = computed(() => toPickerFormat(props.field.config.format, false))
+const dateTimeFormat = computed(() => toPickerFormat(props.field.config.format, true))
 
 function setDate(v: string | null, time: boolean) {
   patch(v || null)
@@ -252,6 +260,7 @@ function rtInput() {
       <el-date-picker
         v-else-if="field.fieldType === 'date'"
         type="date"
+        :format="dateFormat"
         value-format="YYYY-MM-DD"
         placeholder="请选择日期"
         :model-value="dateValue"
@@ -262,6 +271,7 @@ function rtInput() {
       <el-date-picker
         v-else-if="field.fieldType === 'datetime'"
         type="datetime"
+        :format="dateTimeFormat"
         value-format="YYYY-MM-DD HH:mm"
         placeholder="请选择时间"
         :model-value="dateTimeValue"
