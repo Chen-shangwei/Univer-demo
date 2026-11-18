@@ -3,18 +3,18 @@
  * 3.7 审核详情页：以查看人身份 + 记录自身版本重新合并 Schema（7.3），全程只读。
  * 通过 / 驳回写入不可修改的审核留痕；多级审核自动流转至下一节点。
  */
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { Download } from '@element-plus/icons-vue'
 import DetailTable from '../components/DetailTable.vue'
 import DynamicForm from '../components/DynamicForm.vue'
 import SchemaTrace from '../components/SchemaTrace.vue'
-import { api } from '../system/api'
+import { remote } from '../system/http'
 import { db, deptName, orgById, userName } from '../system/db'
 import { canAuditNode } from '../system/service'
 import { detailFields, headerFields } from '../system/schema-service'
 import { current } from '../system/session'
-import { must, run, toast } from '../utils/notify'
+import { must, runAsync, toast } from '../utils/notify'
 import { tagTypeOf, type TagType } from '../utils/display'
 
 const TRAIL_TEXT: Record<string, string> = { pass: '通过', reject: '驳回', revoke: '撤回' }
@@ -25,7 +25,22 @@ const router = useRouter()
 const recordId = String(route.query.recordId ?? '')
 const me = current()
 
-const detail = computed(() => (recordId ? must(api.record.detail(recordId)) : null))
+/* M3 扩面：审核记录读取走后台 /api/record/detail（按记录版本重新合并 Schema） */
+const detail = ref<Record<string, any> | null>(null)
+const loading = ref(false)
+
+async function load() {
+  if (!recordId) return
+  loading.value = true
+  try {
+    const r = await remote.recordDetail(recordId)
+    if (r.code === 200) detail.value = r.data
+    else toast('err', r.msg)
+  } finally {
+    loading.value = false
+  }
+}
+onMounted(load)
 
 const heads = computed(() => (detail.value ? headerFields(detail.value.schema) : []))
 const details = computed(() => (detail.value ? detailFields(detail.value.schema) : []))
@@ -41,7 +56,7 @@ const actionable = computed(() => {
 const nodeInfo = computed(() => {
   const d = detail.value
   if (!d) return '—'
-  const node = d.task.auditNodes.find((n) => n.seq === d.record.currentNode)
+  const node = d.task.auditNodes.find((n: any) => n.seq === d.record.currentNode)
   if (!node) return d.record.recordStatus === 'pass' ? '全部节点已通过' : '不在审中'
   return `第 ${node.seq} 节点「${node.nodeName}」${node.userId ? '（指定审核人：' + userName(node.userId) + '）' : '（审核角色：' + (db.sys_role.find((r) => r.roleCode === node.roleCode)?.roleName ?? '未配置') + '）'}`
 })
@@ -51,31 +66,32 @@ const opinion = ref('')
 const conclusion = ref<'pass' | 'reject'>('pass')
 
 function submit() {
-  run(() => {
-    const res = must(api.audit.operate(recordId, conclusion.value, opinion.value))
+  void runAsync(async () => {
+    const res = must(await remote.auditOperate(recordId, conclusion.value, opinion.value))
     if (!res.ok) throw new Error(res.message)
     toast('ok', res.message)
     opinion.value = ''
+    // 审核结论已落入后台 db，回读刷新状态与留痕
+    await load()
   })
 }
 
 const ATTACH_SIZE = (n: number) => (n > 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(2)} MB` : `${Math.round(n / 1024)} KB`)
 
 function download(attId: string) {
-  run(() => {
-    const d = must(api.attachment.download(attId, 5))
+  void runAsync(async () => {
+    const d = must(await remote.attachmentDownload(attId))
     const a = document.createElement('a')
     a.href = d.url
-    const rec = db.form_attachment.find((x) => x.attId === attId)
-    a.download = rec?.fileName ?? 'file'
+    a.download = d.fileName
     a.click()
-    toast('info', `已签发 5 分钟有效下载凭证（3.9 不暴露存储地址）`)
+    toast('info', `已下载「${d.fileName}」（3.9 不暴露存储地址）`)
   })
 }
 </script>
 
 <template>
-  <div v-if="detail">
+  <div v-if="detail" v-loading="loading">
     <h2 class="page-title">
       {{ detail.task.taskName }}
       <el-tag size="small" :type="tagTypeOf(detail.record.recordStatus)">{{ detail.statusText }}</el-tag>

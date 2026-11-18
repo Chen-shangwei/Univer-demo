@@ -5,10 +5,11 @@
  * 3.8 其二：以当前登录人的字段权限口径呈现，hidden 字段不进入列；
  * 3.8 其五：数据量较大时走异步导出作业，完成后签发 30 分钟有效下载链接。
  */
-import { computed, onBeforeUnmount, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { Search } from '@element-plus/icons-vue'
 import { api } from '../system/api'
-import { db, hasRole, orgById } from '../system/db'
+import { remote } from '../system/http'
+import { hasRole, orgById } from '../system/db'
 import { ASYNC_THRESHOLD, EXPORT_LINK_MINUTES } from '../system/flow'
 import { current } from '../system/session'
 import { ROLE } from '../system/types'
@@ -19,12 +20,12 @@ import { must, fmt, run, toast } from '../utils/notify'
 import { tagTypeOf } from '../utils/display'
 
 const me = current()
-/* ------------------------------------------------ 任务与筛选条件 */
-const tasks = computed(() => db.form_task.filter((t) => t.delFlag === 0))
-const taskId = ref(tasks.value[0]?.taskId ?? '')
+/* ------------------------------------------------ 任务与筛选条件（M3 扩面：任务与下发范围改后台下发） */
+const tasks = ref<Record<string, any>[]>([])
+const taskId = ref('')
 const task = computed(() => tasks.value.find((t) => t.taskId === taskId.value) ?? null)
 
-const scopeOrgs = computed<ID[]>(() => (taskId.value ? must(api.task.scopes(taskId.value)).map((o) => o.orgId) : []))
+const scopeOrgs = ref<ID[]>([])
 const pickedOrgs = ref<ID[]>([])
 const status = ref<RecordStatus | 'none' | ''>('')
 const submitFrom = ref('')
@@ -41,6 +42,8 @@ function switchTask(id: string) {
   submitTo.value = ''
   keyword.value = ''
   pageNum.value = 1
+  void loadScopes()
+  void loadBoard()
 }
 
 function toggleOrg(id: ID) {
@@ -55,18 +58,72 @@ const filter = computed<SummaryFilter>(() => ({
   keyword: keyword.value.trim() || undefined,
 }))
 
-/* ------------------------------------------------ 宽表与进度 */
+/* ------------------------------------------------ 宽表与进度（M3 扩面：看板一次拉取后台 /api/summary/board） */
 const PAGE_SIZE = 20
-const page = computed(() =>
-  taskId.value
-    ? must(api.summary.page(taskId.value, filter.value, { pageNum: pageNum.value, pageSize: PAGE_SIZE }))
-    : null,
-)
+const board = ref<Record<string, any> | null>(null)
+const loading = ref(false)
+const page = computed(() => board.value)
 const columns = computed(() => page.value?.columns ?? [])
 const progress = computed(() => page.value?.progress ?? null)
 const totalRows = computed(() => page.value?.total ?? 0)
 /** 7.4：超过该记录数时界面提示改走异步导出 */
 const needAsync = computed(() => totalRows.value > ASYNC_THRESHOLD)
+
+async function loadTasks() {
+  const r = await remote.taskList()
+  if (r.code === 200) {
+    tasks.value = (r.data ?? []) as Record<string, any>[]
+    if (!taskId.value && tasks.value.length) taskId.value = tasks.value[0].taskId
+  } else toast('err', r.msg)
+}
+async function loadScopes() {
+  if (!taskId.value) {
+    scopeOrgs.value = []
+    return
+  }
+  const r = await remote.taskScopes(taskId.value)
+  if (r.code === 200) scopeOrgs.value = (r.data ?? []).map((o) => o.orgId)
+  else toast('err', r.msg)
+}
+async function loadBoard() {
+  if (!taskId.value) {
+    board.value = null
+    return
+  }
+  loading.value = true
+  try {
+    const r = await remote.summaryBoard({
+      taskId: taskId.value,
+      orgIds: pickedOrgs.value.length ? pickedOrgs.value.join(',') : undefined,
+      status: status.value || undefined,
+      submitFrom: submitFrom.value || undefined,
+      submitTo: submitTo.value || undefined,
+      keyword: keyword.value.trim() || undefined,
+      pageNum: pageNum.value,
+      pageSize: PAGE_SIZE,
+    })
+    if (r.code === 200) board.value = r.data as Record<string, any>
+    else {
+      board.value = null
+      toast('err', r.msg)
+    }
+  } finally {
+    loading.value = false
+  }
+}
+function onQuery() {
+  pageNum.value = 1
+  void loadBoard()
+}
+
+onMounted(async () => {
+  await loadTasks()
+  await Promise.all([loadScopes(), loadBoard()])
+})
+watch([status, submitFrom, submitTo, keyword, pickedOrgs], () => {
+  pageNum.value = 1
+  void loadBoard()
+})
 
 const STATUS_OPTIONS: { value: RecordStatus | 'none' | ''; label: string }[] = [
   { value: '', label: '全部状态' },
@@ -148,7 +205,7 @@ const stateText = () => (page.value ? `共 ${totalRows.value} 行 · ${columns.v
 </script>
 
 <template>
-  <div>
+  <div v-loading="loading">
     <h2 class="page-title">数据汇总与导出</h2>
     <p class="page-sub">
       7.4 行转列为宽表：列对应模板字段、行对应填报记录，明细区多行按行展开；列顺序与模板一致，差异新增列与已停用列单独标注。
@@ -167,7 +224,7 @@ const stateText = () => (page.value ? `共 ${totalRows.value} 行 · ${columns.v
         <span class="muted">~</span>
         <el-date-picker v-model="submitTo" type="date" value-format="YYYY-MM-DD" placeholder="提交时间止" style="width: 150px" />
         <el-input v-model="keyword" :prefix-icon="Search" clearable placeholder="按内容或单位检索" style="width: 220px" />
-        <el-button @click="pageNum = 1">查询</el-button>
+        <el-button @click="onQuery">查询</el-button>
         <span class="spacer" />
         <span class="muted">{{ stateText() }}</span>
       </div>
@@ -283,6 +340,7 @@ const stateText = () => (page.value ? `共 ${totalRows.value} 行 · ${columns.v
           layout="total, prev, pager, next"
           :page-size="PAGE_SIZE"
           :total="totalRows"
+          @current-change="() => loadBoard()"
         />
       </div>
     </div>

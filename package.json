@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
     "check": "vite build --ssr check/run.ts --outDir check/dist --logLevel silent && node check/dist/run.js",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "server:dev": "tsx watch server/index.ts",
+    "server:start": "tsx server/index.ts"
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.2",
@@ -25,6 +27,7 @@
     "@univerjs/sheets-ui": "^1.4.0",
     "@univerjs/ui": "^1.4.0",
     "element-plus": "^2.14.8",
+    "fastify": "^5.12.8",
     "rxjs": "^7.8.2",
     "vue": "^3.5.44",
     "vue-router": "^5.5.0"
@@ -33,6 +36,7 @@
     "@types/node": "^24.19.2",
     "@vitejs/plugin-vue": "^6.0.10",
     "@vue/tsconfig": "^0.9.1",
+    "tsx": "^4.23.15",
     "typescript": "~6.0.3",
     "vite": "^8.3.6",
     "vue-tsc": "^3.3.14"

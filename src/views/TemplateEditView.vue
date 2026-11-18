@@ -235,10 +235,8 @@ const previewData = ref<Record<string, string | number | null>>({})
       <el-text size="small" type="info">共 {{ fields.length }} 个字段</el-text>
     </div>
 
-    <div class="split">
-      <div class="main">
-        <div class="card">
-          <h3>字段清单</h3>
+    <div class="card">
+      <h3>字段清单</h3>
           <el-table :data="fields" border stripe size="small" empty-text="该模板尚无字段">
             <el-table-column prop="sort" label="排序" width="64" align="right" />
             <el-table-column label="字段标识" min-width="140">
@@ -275,31 +273,35 @@ const previewData = ref<Record<string, string | number | null>>({})
             </el-table-column>
           </el-table>
         </div>
-      </div>
-
-      <div class="side">
-        <div class="card">
-          <h3>表单预览（3.2 其五）</h3>
-          <div class="fld">
-            <span class="cap">模拟子单位（差异规则生效范围）</span>
-            <el-select v-model="previewOrg">
-              <el-option
-                v-for="o in db.sys_org.filter((x) => x.orgLevel >= 2 && x.delFlag === 0)"
-                :key="o.orgId"
-                :label="o.orgName"
-                :value="o.orgId"
-              />
-            </el-select>
+        <div class="preview">
+          <div class="preview-side">
+          <div class="card">
+            <div class="preview-hd">
+              <h3>表单预览（3.2 其五）</h3>
+              <el-button type="primary" :icon="View" @click="doPreview">生成预览</el-button>
+            </div>
+            <div class="preview-bar">
+              <label class="fld">
+                <span class="cap">模拟子单位（差异规则生效范围）</span>
+                <el-select v-model="previewOrg">
+                  <el-option
+                      v-for="o in db.sys_org.filter((x) => x.orgLevel >= 2 && x.delFlag === 0)"
+                      :key="o.orgId"
+                      :label="o.orgName"
+                      :value="o.orgId"
+                  />
+                </el-select>
+              </label>
+              <label class="fld">
+                <span class="cap">模拟查看人（权限裁决生效）</span>
+                <el-select v-model="previewUser" filterable>
+                  <el-option v-for="u in db.sys_user.filter((x) => x.delFlag === 0)" :key="u.userId" :label="`${u.realName}（${u.username}）`" :value="u.userId" />
+                </el-select>
+              </label>
+            </div>
           </div>
-          <div class="fld" style="margin-top: 10px">
-            <span class="cap">模拟查看人（权限裁决生效）</span>
-            <el-select v-model="previewUser" filterable>
-              <el-option v-for="u in db.sys_user.filter((x) => x.delFlag === 0)" :key="u.userId" :label="`${u.realName}（${u.username}）`" :value="u.userId" />
-            </el-select>
           </div>
-          <el-button type="primary" :icon="View" style="margin-top: 12px" @click="doPreview">生成预览</el-button>
-        </div>
-
+          <div class="preview-main">
         <template v-if="previewSchema">
           <SchemaTrace :schema="previewSchema" />
           <div class="card">
@@ -314,8 +316,8 @@ const previewData = ref<Record<string, string | number | null>>({})
         <div v-else class="card">
           <el-empty description="选择单位与查看人后生成预览，用于下发前确认差异与权限是否符合预期" :image-size="72" />
         </div>
-      </div>
-    </div>
+          </div>
+        </div>
 
     <!-- 3.2 字段配置：字段标识保存后不可变更 -->
     <el-dialog
@@ -407,6 +409,43 @@ const previewData = ref<Record<string, string | number | null>>({})
 </template>
 
 <style scoped>
+.preview {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--app-gap);
+  margin-top: var(--app-gap);
+}
+
+.preview-side {
+  width: 300px;
+  flex: none;
+}
+
+.preview-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--app-gap);
+}
+.preview-hd {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--app-gap);
+  margin-bottom: 14px;
+}
+
+.preview-hd h3 {
+  margin: 0;
+}
+
+.preview-bar {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: var(--app-gap);
+}
+
 .cfg {
   display: block;
   max-width: 260px;

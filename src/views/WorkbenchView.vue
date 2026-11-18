@@ -3,25 +3,40 @@
  * 6.1 工作台（表 26 首页）：按角色聚合待办、进行中的任务与最近操作留痕。
  * 10.2 表 31 权限矩阵在此常驻呈现，并与实际生效的功能权限逐格自检。
  */
-import { computed } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { Right, WarningFilled } from '@element-plus/icons-vue'
-import { api } from '../system/api'
+import { remote } from '../system/http'
 import { orgById, rolesOf, userById } from '../system/db'
 import { ROLE_LABEL } from '../system/schema-service'
 import { current, PERM_MATRIX, permMatrixAudit } from '../system/session'
 import type { RoleCode } from '../system/types'
 import { LEVEL_TAG, tagTypeOf } from '../utils/display'
-import { must } from '../utils/notify'
+import { toast } from '../utils/notify'
 
 const router = useRouter()
 const user = computed(() => current())
-const data = computed(() => must(api.summary.workbench()))
+const data = ref<Record<string, any> | null>(null)
+const loading = ref(false)
+
+/** M3：工作台聚合数据改为从后台异步拉取（数据来自服务端真实 flow.workbench） */
+async function loadData() {
+  loading.value = true
+  try {
+    const r = await remote.workbench()
+    if (r.code === 200) data.value = r.data
+    else toast('err', r.msg)
+  } finally {
+    loading.value = false
+  }
+}
+onMounted(loadData)
 
 /** 角色相关的关键指标卡（10.2 权限矩阵决定看到哪些） */
 const cards = computed(() => {
   const d = data.value
   const list: { label: string; value: number; to?: string; note: string }[] = []
+  if (!d) return list
   if (user.value && d.fillCount >= 0) list.push({ label: '待我填报', value: d.fillCount, to: '/fill/list', note: '处于填报窗口内的任务' })
   if (d.rejectedCount) list.push({ label: '被驳回待修改', value: d.rejectedCount, to: '/fill/list', note: '含审核意见，修改后可重新提交' })
   if (d.draftCount) list.push({ label: '草稿', value: d.draftCount, to: '/fill/list', note: '30 秒自动保存的内容' })
@@ -71,7 +86,7 @@ function matrixClass({ row }: { row: { mine: boolean } }) {
 </script>
 
 <template>
-  <div>
+  <div v-loading="loading">
     <h2 class="page-title">工作台</h2>
     <p class="page-sub">
       {{ user?.realName }}，欢迎回来。当前单位 {{ orgById(user?.orgId ?? '')?.orgName }}，这里只汇总与您角色相关的待办（10.2）。
@@ -92,11 +107,11 @@ function matrixClass({ row }: { row: { mine: boolean } }) {
       </div>
     </div>
 
-    <div class="split" style="margin-top: 16px">
-      <div class="main">
+    <div class="split wb-split" style="margin-top: 16px">
+      <div class="main wb-left">
         <div class="card">
           <h3>我的任务（前 6 条）</h3>
-          <el-table :data="data.myViews" size="small" border empty-text="当前账号没有可见任务">
+          <el-table :data="data?.myViews ?? []" size="small" border empty-text="当前账号没有可见任务">
             <el-table-column label="任务" min-width="220" show-overflow-tooltip>
               <template #default="{ row }">
                 {{ row.taskName }}
@@ -124,6 +139,38 @@ function matrixClass({ row }: { row: { mine: boolean } }) {
             </el-table-column>
           </el-table>
         </div>
+
+        <!-- 10.2 表 31：功能权限基线，高亮行为当前账号所具备的档位 -->
+        <div class="card">
+          <div class="row-gap">
+            <h3 style="margin: 0">角色权限矩阵（10.2 表 31）</h3>
+            <span class="spacer" />
+            <el-tag v-if="!drift.length" type="success" effect="plain">矩阵与生效权限逐格一致</el-tag>
+            <el-tag v-else type="danger" effect="plain">{{ drift.length }} 处口径不一致</el-tag>
+            <el-button size="small" @click="router.push('/template/perm')">字段权限验证入口</el-button>
+          </div>
+          <el-table :data="matrixRows" size="small" border class="matrix-table" :row-class-name="matrixClass">
+            <el-table-column label="角色" width="150" fixed>
+              <template #default="{ row }">
+                {{ row.name }}
+                <el-tag v-if="row.mine" size="small" effect="plain">当前</el-tag>
+                <div class="mono muted">{{ row.role }}</div>
+              </template>
+            </el-table-column>
+            <el-table-column v-for="(c, ci) in PERM_MATRIX" :key="c.label" :label="c.label" min-width="104" align="center">
+              <template #default="{ row }">
+                <el-tag size="small" effect="plain" :type="LEVEL_TAG[row.cells[ci].level] ?? 'info'">{{ row.cells[ci].level }}</el-tag>
+                <el-tooltip v-if="!row.cells[ci].ok" :content="`生效为 ${row.cells[ci].actual}`" placement="top">
+                  <el-icon class="drift"><WarningFilled /></el-icon>
+                </el-tooltip>
+              </template>
+            </el-table-column>
+          </el-table>
+          <p class="flow-hint">
+            上表为功能权限基线；字段权限需在填报与审核两个场景分别验证——填报场景重点看 edit 与 hidden，
+            审核场景重点看 read 与 hidden（3.4）。高亮行为当前账号命中的角色。
+          </p>
+        </div>
       </div>
 
       <div class="side">
@@ -131,7 +178,7 @@ function matrixClass({ row }: { row: { mine: boolean } }) {
           <h3>最近操作留痕（3.10）</h3>
           <el-timeline>
             <el-timeline-item
-              v-for="l in data.recentLogs"
+              v-for="l in data?.recentLogs ?? []"
               :key="l.logId"
               :timestamp="l.operTime"
               :type="l.result === 1 ? 'primary' : 'danger'"
@@ -149,42 +196,26 @@ function matrixClass({ row }: { row: { mine: boolean } }) {
         </div>
       </div>
     </div>
-
-    <!-- 10.2 表 31：功能权限基线，高亮行为当前账号所具备的档位 -->
-    <div class="card" style="margin-top: 16px">
-      <div class="row-gap">
-        <h3 style="margin: 0">角色权限矩阵（10.2 表 31）</h3>
-        <span class="spacer" />
-        <el-tag v-if="!drift.length" type="success" effect="plain">矩阵与生效权限逐格一致</el-tag>
-        <el-tag v-else type="danger" effect="plain">{{ drift.length }} 处口径不一致</el-tag>
-        <el-button size="small" @click="router.push('/template/perm')">字段权限验证入口</el-button>
-      </div>
-      <el-table :data="matrixRows" size="small" border class="matrix-table" :row-class-name="matrixClass">
-        <el-table-column label="角色" width="150" fixed>
-          <template #default="{ row }">
-            {{ row.name }}
-            <el-tag v-if="row.mine" size="small" effect="plain">当前</el-tag>
-            <div class="mono muted">{{ row.role }}</div>
-          </template>
-        </el-table-column>
-        <el-table-column v-for="(c, ci) in PERM_MATRIX" :key="c.label" :label="c.label" min-width="104" align="center">
-          <template #default="{ row }">
-            <el-tag size="small" effect="plain" :type="LEVEL_TAG[row.cells[ci].level] ?? 'info'">{{ row.cells[ci].level }}</el-tag>
-            <el-tooltip v-if="!row.cells[ci].ok" :content="`生效为 ${row.cells[ci].actual}`" placement="top">
-              <el-icon class="drift"><WarningFilled /></el-icon>
-            </el-tooltip>
-          </template>
-        </el-table-column>
-      </el-table>
-      <p class="flow-hint">
-        上表为功能权限基线；字段权限需在填报与审核两个场景分别验证——填报场景重点看 edit 与 hidden，
-        审核场景重点看 read 与 hidden（3.4）。高亮行为当前账号命中的角色。
-      </p>
-    </div>
   </div>
 </template>
 
 <style scoped>
+/* 本页专用：左右两栏顶部对齐后拉伸到同高，让右侧时间线卡片跟随左列高度，不留白 */
+.wb-split {
+  align-items: stretch;
+}
+
+.wb-left {
+  display: flex;
+  flex-direction: column;
+  gap: var(--app-gap);
+}
+
+/* 用 flex gap 控制卡片间距，重置全局 .card 默认的 margin-bottom 避免双重间距 */
+.wb-left > .card {
+  margin-bottom: 0;
+}
+
 .stat {
   position: relative;
 }

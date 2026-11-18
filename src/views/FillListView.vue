@@ -4,14 +4,14 @@
  * 任务按状态分组（待填报 / 草稿 / 已提交 / 已驳回 / 已归档 / 未填报），
  * 不可填报的任务原样展示原因，而不是把按钮置灰让用户猜（3.6 其五）。
  */
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { Search } from '@element-plus/icons-vue'
-import { api } from '../system/api'
+import { remote } from '../system/http'
 import { current } from '../system/session'
 import type { TaskView } from '../system/flow'
 import { tagTypeOf } from '../utils/display'
-import { must, run } from '../utils/notify'
+import { run, toast } from '../utils/notify'
 
 const router = useRouter()
 const GROUPS = ['全部', '待填报', '草稿', '已驳回', '已提交', '已归档', '未填报'] as const
@@ -19,7 +19,21 @@ const group = ref<(typeof GROUPS)[number]>('全部')
 const keyword = ref('')
 
 const me = current()
-const views = computed<TaskView[]>(() => (me ? must(api.task.myList(me.userId)) : []))
+const views = ref<TaskView[]>([])
+const loading = ref(false)
+
+/** M3 扩面：我的填报任务视图改由后台 taskViewsFor 下发 */
+async function load() {
+  loading.value = true
+  try {
+    const r = await remote.taskMyList()
+    if (r.code === 200) views.value = (r.data ?? []) as unknown as TaskView[]
+    else toast('err', r.msg)
+  } finally {
+    loading.value = false
+  }
+}
+onMounted(load)
 
 const counted = computed(() => {
   const map = new Map<string, number>()
@@ -51,7 +65,7 @@ function addRecord(v: TaskView) {
 </script>
 
 <template>
-  <div>
+  <div v-loading="loading">
     <h2 class="page-title">我的填报任务</h2>
     <p class="page-sub">
       3.6：仅展示本单位在下发范围内的任务。已提交与已归档的数据不可再改为草稿；被驳回的任务会常驻显示审核意见。

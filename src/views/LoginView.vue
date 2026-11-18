@@ -8,7 +8,7 @@ import { useRouter } from 'vue-router'
 import { Lock, User } from '@element-plus/icons-vue'
 import type { FormInstance, FormRules } from 'element-plus'
 import { db, rolesOf } from '../system/db'
-import { api } from '../system/api'
+import { remote } from '../system/http'
 import { ROLE_LABEL } from '../system/schema-service'
 import { homeOf } from '../system/session'
 import { toast } from '../utils/notify'
@@ -44,12 +44,12 @@ async function submit() {
   if (!(await formRef.value?.validate().catch(() => false))) return
   busy.value = true
   try {
-    const r = api.auth.login(model.username.trim(), model.password)
+    const r = await remote.login(model.username.trim(), model.password)
     if (r.code !== 200) {
       toast('err', r.msg)
       return
     }
-    const u = db.sys_user.find((x) => x.userId === r.data.userId)!
+    const u = db.sys_user.find((x) => x.userId === r.data.user.userId)!
     toast('ok', `欢迎，${u.realName}`)
     router.replace(homeOf(u))
   } finally {

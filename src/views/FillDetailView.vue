@@ -11,13 +11,13 @@ import DetailGrid from '../components/DetailGrid.vue'
 import DetailTable from '../components/DetailTable.vue'
 import DynamicForm from '../components/DynamicForm.vue'
 import SchemaTrace from '../components/SchemaTrace.vue'
-import { api } from '../system/api'
+import { remote } from '../system/http'
 import { db } from '../system/db'
 import { current } from '../system/session'
 import { detailFields, headerFields } from '../system/schema-service'
 import type { FillContext, WriteResult } from '../system/flow'
 import type { FieldValue } from '../system/types'
-import { must, fmt, run, toast } from '../utils/notify'
+import { must, fmt, runAsync, toast } from '../utils/notify'
 import { tagTypeOf, type TagType } from '../utils/display'
 
 const route = useRoute()
@@ -39,23 +39,27 @@ const errors = ref<WriteResult['errors']>([])
 const saveHint = ref('')
 const dirtyAt = ref('')
 
-/* ------------------------------------------------ 进入页面 */
-function enter() {
-  run(() => {
-    const r = api.form.load(taskId, seq)
-    if (r.code === 200) {
-      conflict.value = ''
-      ctx.value = r.data
-    } else if (r.code === 1009) {
-      // 7.5：他人正在编辑同一单位同一任务，本次以只读方式打开，数据不被覆盖
-      conflict.value = r.msg
-      ctx.value = must(api.form.load(taskId, seq, undefined, false))
-      forceReadonly.value = true
-    } else {
-      must(r)
+/* ------------------------------------------------ 进入页面（M3 扩面：填报读取走后台 /api/form/load） */
+async function enter() {
+  const r = await remote.formLoad(taskId, seq)
+  if (r.code === 200) {
+    conflict.value = ''
+    ctx.value = r.data
+  } else if (r.code === 1009) {
+    // 7.5：他人正在编辑同一单位同一任务，本次以只读方式打开，数据不被覆盖
+    conflict.value = r.msg
+    const ro = await remote.formLoad(taskId, seq, false)
+    if (ro.code === 200) ctx.value = ro.data
+    else {
+      toast('err', ro.msg)
+      return
     }
-    hydrate()
-  })
+    forceReadonly.value = true
+  } else {
+    toast('err', r.msg)
+    return
+  }
+  hydrate()
 }
 
 function hydrate() {
@@ -87,10 +91,10 @@ function collectRows(): Record<string, FieldValue>[] {
   return grid.value ? grid.value.sync() : rows.value.map((r) => ({ ...r }))
 }
 
-/* ------------------------------------------------ 保存 / 提交 */
+/* ------------------------------------------------ 保存 / 提交（M3 扩面：写操作走后台 db，与读取同一数据源） */
 function doSave(auto: boolean) {
-  run(() => {
-    const r = must(api.record.draft(taskId, seq, data.value, collectRows(), auto))
+  void runAsync(async () => {
+    const r = must(await remote.saveDraft(taskId, seq, data.value, collectRows(), auto))
     if (!r.ok) throw new Error(r.message)
     errors.value = r.errors
     snapshot.value = digest()
@@ -100,8 +104,8 @@ function doSave(auto: boolean) {
 }
 
 function doSubmit() {
-  run(() => {
-    const r = must(api.record.submit(taskId, seq, data.value, collectRows()))
+  void runAsync(async () => {
+    const r = must(await remote.submitReport(taskId, seq, data.value, collectRows()))
     errors.value = r.errors
     if (!r.ok) {
       toast('err', r.message)
@@ -111,13 +115,13 @@ function doSubmit() {
     toast('ok', r.message)
     snapshot.value = digest()
     // 提交后重新载入：状态、审核留痕与只读判定均以服务层为准
-    enter()
+    await enter()
   })
 }
 
 function doValidate() {
-  run(() => {
-    const list = must(api.form.validate(taskId, seq, data.value, collectRows()))
+  void runAsync(async () => {
+    const list = must(await remote.formValidate(taskId, seq, data.value, collectRows()))
     errors.value = list
     if (!list.length) toast('ok', '四类校验全部通过（必填 / 格式 / 附件 / 唯一性）')
     else {
@@ -151,9 +155,9 @@ function startTimers() {
     dirtyAt.value = fmt(new Date()).slice(11, 19)
     doSave(true)
   }, 30_000)
-  lockTimer = window.setInterval(() => {
+  lockTimer = window.setInterval(async () => {
     if (!editable.value) return
-    const r = api.record.heartbeat(taskId)
+    const r = await remote.heartbeat(taskId)
     if (r.code === 200 && r.data && r.data !== me?.realName) {
       conflict.value = `该填报已被「${r.data}」占用，已停止自动保存（7.5）`
       forceReadonly.value = true
@@ -170,7 +174,7 @@ function stopTimers(): void {
 }
 
 onMounted(() => {
-  enter()
+  void enter()
   startTimers()
 })
 onBeforeUnmount(stopTimers)

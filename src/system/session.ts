@@ -44,6 +44,23 @@ export function logout(): void {
   localStorage.removeItem(SESSION_KEY)
 }
 
+/**
+ * M3 前端联调：登录改走后台后，用后端签发的令牌接管本地会话。
+ * 仅写入 userId + 后端 token + 过期时间，current() 仍按 userId 回查本地表驱动其余页面。
+ */
+export function adoptSession(u: SysUser, token: string): void {
+  const s: SessionState = { userId: u.userId, token, issuedAt: Date.now(), expireAt: Date.now() + TOKEN_TTL }
+  session.value = s
+  localStorage.setItem(SESSION_KEY, JSON.stringify(s))
+}
+
+/** 供 http 层读取当前有效令牌；未登录或过期返回 null */
+export function sessionToken(): string | null {
+  const s = session.value
+  if (!s || Date.now() > s.expireAt) return null
+  return s.token
+}
+
 /** 令牌校验：401 未登录或令牌失效 */
 export function current(): SysUser | null {
   const s = session.value

@@ -7,9 +7,9 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { Delete, Document, Download, UploadFilled } from '@element-plus/icons-vue'
 import type { UploadFile, UploadInstance } from 'element-plus'
-import { api } from '../system/api'
+import { remote } from '../system/http'
 import type { FormAttachment, ID, SchemaField } from '../system/types'
-import { must, run, toast } from '../utils/notify'
+import { must, runAsync, toast } from '../utils/notify'
 
 const props = withDefaults(
   defineProps<{
@@ -34,10 +34,12 @@ const hint = computed(
   () => `允许 ${accept.value.length ? accept.value.join('/') : '常见办公与图片格式'}，单文件 ≤ ${maxSize.value}MB，最多 ${maxCount.value} 个`,
 )
 
-function reload() {
-  list.value = must(api.attachment.list(props.recordId, props.field.fieldKey))
+async function reload() {
+  const r = await remote.attachmentList(props.recordId, props.field.fieldKey)
+  if (r.code === 200) list.value = r.data ?? []
+  else toast('err', r.msg)
 }
-watch(() => props.recordId, reload, { immediate: true })
+watch(() => props.recordId, () => void reload(), { immediate: true })
 
 /** 小于该阈值才把内容内联到本地库，模拟对象存储的小文件直传 */
 const INLINE_LIMIT = 1.5 * 1024 * 1024
@@ -95,7 +97,7 @@ function enqueue(file: File) {
     progress.value = ''
     try {
       const blob = await readDataUrl(file)
-      const r = api.attachment.upload(
+      const r = await remote.attachmentUpload(
         props.recordId,
         props.field.fieldKey,
         { name: file.name, size: file.size, type: file.type },
@@ -104,7 +106,7 @@ function enqueue(file: File) {
       )
       if (r.code !== 200) toast('err', r.msg)
       else if (!blob) toast('info', `「${file.name}」较大，原型仅登记文件信息（真实环境由对象存储承接）`)
-      reload()
+      await reload()
     } catch (err) {
       toast('err', err instanceof Error ? err.message : '上传失败')
     } finally {
@@ -116,10 +118,10 @@ function enqueue(file: File) {
 }
 
 function del(a: FormAttachment) {
-  run(() => {
-    must(api.attachment.remove(a.attId, props.editable))
+  void runAsync(async () => {
+    must(await remote.attachmentRemove(a.attId, props.editable))
     toast('ok', `已删除「${a.fileName}」`)
-    reload()
+    await reload()
   })
 }
 
@@ -128,8 +130,8 @@ const link = ref<{ url: string; fileName: string; left: number } | null>(null)
 let timer = 0
 
 function download(a: FormAttachment) {
-  run(() => {
-    const d = must(api.attachment.download(a.attId, 5))
+  void runAsync(async () => {
+    const d = must(await remote.attachmentDownload(a.attId))
     if (timer) window.clearInterval(timer)
     link.value = { url: d.url, fileName: a.fileName, left: Math.round((d.expireAt - Date.now()) / 1000) }
     const el = document.createElement('a')
